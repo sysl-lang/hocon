@@ -1,0 +1,502 @@
+module sh.sysl.hocon
+
+import sh.sysl.parsing.{Span, Source}
+import sysl.buf.{Buf, buf}
+import sysl.text.{from_utf8_unchecked, str_builder, StrBuilder}
+
+// The tree a document reads into, and what a caller asks of one.
+//
+// **Every value carries the span it was written at**, and that is the reason this package exists
+// rather than a reader that answers strings: a program that reads a HOCON file to check it -- a
+// manifest, a board description -- has to point at the line that is wrong, and a value that has
+// forgotten where it came from leaves the caller with nothing to point at. A key carries its own span
+// as well, because "this name is unknown" points at the name and "this value is the wrong kind"
+// points at the value.
+//
+// **The tree owns itself.** An object holds a `Buf[Field]` and an array a `Buf[Value]`, with no `&`
+// anywhere, so every walk over a document is a plain `match`. That is the shape `sysl-lang/json` and
+// `sysl-lang/toml` read into, deliberately: the three formats are read for the same reasons.
+//
+// **A document keeps the order it was written in.** Fields are a sequence rather than a map, so an
+// object renders back the way it arrived and a diagnostic about "the unknown key" names the first one
+// the reader will find. `get` is a linear scan, which is the right trade for configuration.
+
+/** One field of an object: its name, where the name was written, and its value.
+ *
+ * `implied` is true for an object that a dotted key made rather than one the document wrote: in
+ * `a.b = 1`, the field `a` is implied. A caller looking for a name written twice (`Document.repeats`)
+ * is told only about fields the document wrote out.
+ */
+struct Field
+    key: string
+    key_span: Span
+    value: Value
+    implied: bool
+
+/** A value and the span of text it was read from. */
+struct Value
+    span: Span
+    kind: Kind
+
+    /** The field an object holds under a name, or `None` -- for a name it does not hold, and for a
+     * value that is not an object.
+     */
+    get(self, key: string) -> Option[Value]
+        self.field(key) match
+            Some(f) -> Some(f.value)
+            None -> None
+    end get
+
+    /** The field itself, with the span of its name. */
+    field(self, key: string) -> Option[Field]
+        self.kind match
+            Obj(fields) ->
+                for f in fields
+                    if f.key == key then return Some(f)
+
+                None
+            _ -> None
+    end field
+
+    /** The value at a dotted path, `a.b.c`, reached one object at a time. A path segment holding a dot
+     * cannot be named this way; walk with `get` for those.
+     */
+    at(self, path: string) -> Option[Value]
+        var here = self
+        var from: usize = 0
+        val b = path.bytes
+
+        for i in 0..(b.len)
+            if i == b.len || b[i] == u8('.')
+                here.get(path[from..<i]) match
+                    Some(v) -> here = v
+                    None -> return None
+
+                from = i + 1
+            end if
+        end for
+
+        Some(here)
+    end at
+
+    /** An object's fields in the order they were written, or none. */
+    fields(self) -> Buf[Field]
+        self.kind match
+            Obj(fields) -> fields
+            _ -> buf()
+
+    /** An array's elements, or none. */
+    items(self) -> Buf[Value]
+        self.kind match
+            Arr(items) -> items
+            _ -> buf()
+
+    /** The text of a string, quoted or not. A number is not text here: ask `as_long` or `as_real`. */
+    as_text(self) -> Option[string]
+        self.kind match
+            Str(s) -> Some(s)
+            Word(s) -> Some(s)
+            _ -> None
+
+    as_long(self) -> Option[long]
+        self.kind match
+            Int(n) -> Some(n)
+            _ -> None
+
+    /** A number of either kind, as a real. */
+    as_real(self) -> Option[real]
+        self.kind match
+            Int(n) -> Some(real(n))
+            Real(x) -> Some(x)
+            _ -> None
+
+    as_bool(self) -> Option[bool]
+        self.kind match
+            Bool(b) -> Some(b)
+            _ -> None
+
+    is_obj(self) -> bool = self.kind match
+        Obj(_) -> true
+        _ -> false
+
+    is_arr(self) -> bool = self.kind match
+        Arr(_) -> true
+        _ -> false
+
+    is_null(self) -> bool = self.kind match
+        Null -> true
+        _ -> false
+
+    /** What kind of value this is, with its article, for a message: `an object`, `a string`. */
+    kind_name(self) -> string = self.kind match
+        Obj(_) -> "an object"
+        Arr(_) -> "an array"
+        Str(_) -> "a string"
+        Word(_) -> "a string"
+        Int(_) -> "a number"
+        Real(_) -> "a number"
+        Bool(_) -> "a boolean"
+        Null -> "null"
+        Subst(_, _) -> "a substitution"
+        Concat(_) -> "a concatenation"
+        Merge(_) -> "a merge"
+end Value
+
+/** What a value is.
+ *
+ * **A quoted string and an unquoted one are two variants**, as the sysl compiler's own manifest reader
+ * keeps them: `version = 3` and `version = "3"` are different answers where a key wants a word, and
+ * a reader that folded them would leave the caller unable to say which was written. A bare word that
+ * is a whole number is an `Int`, one that is a decimal or has an exponent a `Real`, and `true`,
+ * `false` and `null` are what they say -- the rule JSON's grammar gives, which HOCON keeps.
+ *
+ * **The last three only exist between reading and resolving.** `parse` answers a resolved tree, in
+ * which no `Subst`, `Concat` or `Merge` is left; `parse_unresolved` answers the tree as written, for
+ * a caller that wants to see the substitutions themselves.
+ */
+enum Kind
+    Obj(fields: Buf[Field])
+    Arr(items: Buf[Value])
+    Str(s: string)
+    Word(s: string)
+    Int(n: long)
+    Real(x: real)
+    Bool(b: bool)
+    Null
+    // `${a.b}`, or `${?a.b}` where `optional` -- the path is its segments.
+    Subst(path: Buf[string], optional: bool)
+    // Values written side by side, `${base} { extra = 1 }` or `${dir}/bin`. A part that is all
+    // whitespace is a `Word` of that whitespace, which counts between strings and not between objects.
+    Concat(parts: Buf[Value])
+    // One key set more than once where a later setting is not known to replace the earlier until the
+    // substitutions are resolved: the layers in order, the last on top.
+    Merge(layers: Buf[Value])
+end Kind
+
+/** A name written twice in one object: where it was first written, and where again.
+ *
+ * HOCON allows it -- two objects under one name merge, and a later plain value replaces an earlier
+ * one -- so it is not an error here. It is recorded because a format built on HOCON often wants it
+ * to be one: two parts under one name on a board is a mistake, not a merge.
+ */
+struct Repeat
+    path: string
+    first: Span
+    again: Span
+
+/** A document: its root, and every name it wrote twice. */
+struct Document
+    root: Value
+    repeats: Buf[Repeat]
+
+/** Whether two values are the same tree, whatever spans they were read from. */
+same(a: Value, b: Value) -> bool
+    a.kind match
+        Obj(xs) ->
+            b.kind match
+                Obj(ys) ->
+                    if xs.len() != ys.len() then return false
+
+                    for i in 0..<xs.len()
+                        if xs.at(i).key != ys.at(i).key || !same(xs.at(i).value, ys.at(i).value)
+                            return false
+
+                    true
+                _ -> false
+        Arr(xs) ->
+            b.kind match
+                Arr(ys) -> same_items(xs, ys)
+                _ -> false
+        Str(s) -> b.kind match
+            Str(t) -> s == t
+            _ -> false
+        Word(s) -> b.kind match
+            Word(t) -> s == t
+            _ -> false
+        Int(n) -> b.kind match
+            Int(m) -> n == m
+            _ -> false
+        Real(x) -> b.kind match
+            Real(y) -> x == y
+            _ -> false
+        Bool(p) -> b.kind match
+            Bool(q) -> p == q
+            _ -> false
+        Null -> b.is_null()
+        Subst(p, o) -> b.kind match
+            Subst(q, r) -> o == r && same_names(p, q)
+            _ -> false
+        Concat(xs) -> b.kind match
+            Concat(ys) -> same_items(xs, ys)
+            _ -> false
+        Merge(xs) -> b.kind match
+            Merge(ys) -> same_items(xs, ys)
+            _ -> false
+end same
+
+private same_items(xs: Buf[Value], ys: Buf[Value]) -> bool
+    if xs.len() != ys.len() then return false
+
+    for i in 0..<xs.len()
+        if !same(xs.at(i), ys.at(i)) then return false
+
+    true
+end same_items
+
+private same_names(xs: Buf[string], ys: Buf[string]) -> bool
+    if xs.len() != ys.len() then return false
+
+    for i in 0..<xs.len()
+        if xs.at(i) != ys.at(i) then return false
+
+    true
+end same_names
+
+/** A path written the way a document would write it: segments joined by dots, and a segment that
+ * could not be written bare quoted.
+ */
+path_text(segments: Buf[string]) -> string
+    var b = str_builder()
+
+    for i in 0..<segments.len()
+        if i > 0 then b.push(".")
+
+        b.push(key_text(segments.at(i)))
+
+    b.finish()
+end path_text
+
+// -- writing a value back out ---------------------------------------------------------------------
+
+/** A value as HOCON text that reads back to the same tree.
+ *
+ * The root object is written without braces, one field to a line, as a file is; a nested object is
+ * a block under its key. An array of scalars is written on one line and any other array one element
+ * to a line. A key or a string that could not be written bare is quoted, with JSON's escapes.
+ */
+render(v: Value) -> string
+    var b = str_builder()
+
+    v.kind match
+        Obj(fields) -> render_fields(&b, fields, 0)
+        _ ->
+            render_value(&b, v, 0)
+            b.push("\n")
+
+    b.finish()
+end render
+
+private render_fields(b: *StrBuilder, fields: Buf[Field], depth: int)
+    for f in fields
+        indent(b, depth)
+        b.push(key_text(f.key))
+
+        f.value.kind match
+            Obj(_) -> b.push(" ")
+            _ -> b.push(" = ")
+
+        render_value(b, f.value, depth)
+        b.push("\n")
+end render_fields
+
+private render_value(b: *StrBuilder, v: Value, depth: int)
+    v.kind match
+        Obj(fields) ->
+            if fields.is_empty()
+                b.push("{}")
+            else
+                b.push("{\n")
+                render_fields(b, fields, depth + 1)
+                indent(b, depth)
+                b.push("}")
+        Arr(items) ->
+            if items.is_empty()
+                b.push("[]")
+            elif all_scalars(items)
+                b.push("[")
+
+                for i in 0..<items.len()
+                    if i > 0 then b.push(", ")
+
+                    render_value(b, items.at(i), depth)
+
+                b.push("]")
+            else
+                b.push("[\n")
+
+                for item in items
+                    indent(b, depth + 1)
+                    render_value(b, item, depth + 1)
+                    b.push("\n")
+
+                indent(b, depth)
+                b.push("]")
+        Str(s) -> b.push(quoted(s))
+        Word(s) -> b.push(if bare_word(s) then s else quoted(s))
+        Int(n) -> b.push(str(n))
+        Real(x) -> b.push(real_text(x))
+        Bool(on) -> b.push(if on then "true" else "false")
+        Null -> b.push("null")
+        Subst(p, optional) ->
+            b.push(if optional then "${?" else "${")
+            b.push(path_text(p))
+            b.push("}")
+        Concat(parts) ->
+            for part in parts
+                render_value(b, part, depth)
+        Merge(layers) ->
+            // A merge has no spelling of its own: it is the same key written once per layer, which a
+            // field cannot say. Written as a concatenation it reads back as the same merge wherever
+            // every layer is an object, which is the only case a merge is kept for.
+            for i in 0..<layers.len()
+                if i > 0 then b.push(" ")
+
+                render_value(b, layers.at(i), depth)
+end render_value
+
+private all_scalars(items: Buf[Value]) -> bool
+    for item in items
+        if item.is_obj() || item.is_arr() then return false
+
+    true
+end all_scalars
+
+private indent(b: *StrBuilder, depth: int)
+    for _ in 0..<depth
+        b.push("  ")
+
+// A real written so that it reads back as a real: `1.0` and not `1`, which would come back an `Int`.
+private real_text(x: real) -> string
+    val t = str(x)
+
+    for c in t.bytes
+        if c == u8('.') || c == u8('e') || c == u8('E') || c == u8('n') || c == u8('i') then return t
+
+    s"$t.0"
+end real_text
+
+// A key as a document would write it: bare where every byte may stand in a bare key and the reading
+// would not split it at a dot, quoted otherwise.
+private key_text(k: string) -> string = if bare_key(k) then k else quoted(k)
+
+private bare_key(k: string) -> bool
+    if k.is_empty() then return false
+    if k == "include" then return false
+
+    for i in 0..<k.bytes.len
+        val c = k.bytes[i]
+
+        if c == u8('.') || !unquoted_byte(k.bytes, i) then return false
+
+    true
+end bare_key
+
+// Whether a word read back unquoted would be this same word: every byte allowed, no whitespace at
+// either end, and not a word the reader turns into something else -- a number, `true`, `null`.
+private bare_word(s: string) -> bool
+    if s.is_empty() || s == "true" || s == "false" || s == "null" || s == "include" then return false
+    if is_number_text(s.bytes) then return false
+
+    val last = s.bytes.len - 1
+
+    if s.bytes[0] == u8(' ') || s.bytes[0] == u8('\t') then return false
+    if s.bytes[last] == u8(' ') || s.bytes[last] == u8('\t') then return false
+
+    for i in 0..<s.bytes.len
+        val c = s.bytes[i]
+
+        // A space between two words is part of an unquoted value; anything else must stand bare.
+        if c != u8(' ') && !unquoted_byte(s.bytes, i) then return false
+
+    true
+end bare_word
+
+/** A string as a quoted HOCON string, with JSON's escapes: the quote, the backslash, the three
+ * whitespace controls by letter, and every other control character as `\u00XX`. Every character
+ * above ASCII is copied as it is.
+ */
+quoted(s: string) -> string
+    var out: Buf[u8] = buf()
+
+    out.push(u8('"'))
+
+    for c in s.bytes
+        if c == u8('"') then
+            out.extend("\\\"".bytes)
+        elif c == u8('\\') then
+            out.extend("\\\\".bytes)
+        elif c == u8('\n') then
+            out.extend("\\n".bytes)
+        elif c == u8('\r') then
+            out.extend("\\r".bytes)
+        elif c == u8('\t') then
+            out.extend("\\t".bytes)
+        elif c < 32 || c == 127 then
+            out.extend("\\u00".bytes)
+            out.push(hex_digit(c >> 4))
+            out.push(hex_digit(c & 15))
+        else
+            out.push(c)
+
+    out.push(u8('"'))
+    from_utf8_unchecked(out.view())
+end quoted
+
+private hex_digit(v: u8) -> u8 = if v < 10 then v + u8('0') else v - 10 + u8('a')
+
+// -- the character classes the reader and the writer share ------------------------------------------
+
+// Whether the byte at `i` may stand in an unquoted string or key. HOCON's own list of the forbidden
+// ones, less `+` -- which is kept where it is not the start of `+=`, so that a version's build
+// metadata (`1.0.0+build`) needs no quotes, as the sysl compiler's manifest reader has always read it.
+// `//` starts a comment, and whitespace ends a word.
+private[hocon] unquoted_byte(b: []const u8, i: usize) -> bool
+    val c = b[i]
+
+    if c == u8(' ') || c == u8('\t') || c == u8('\n') || c == u8('\r') then return false
+    if c == u8('/') && i + 1 < b.len && b[i + 1] == u8('/') then return false
+    if c == u8('+') then return !(i + 1 < b.len && b[i + 1] == u8('='))
+
+    !forbidden(c)
+end unquoted_byte
+
+private forbidden(c: u8) -> bool =
+    c == u8('$') || c == u8('"') || c == u8('{') || c == u8('}') || c == u8('[') || c == u8(']') ||
+    c == u8(':') || c == u8('=') || c == u8(',') || c == u8('#') || c == u8('`') || c == u8('^') ||
+    c == u8('?') || c == u8('!') || c == u8('@') || c == u8('*') || c == u8('&') || c == u8('\\')
+
+// Whether a run of bytes is a JSON number: an optional minus, an integer part with no leading zero,
+// then an optional fraction and exponent. `1.0.0` is not one, which is why a version is a word.
+private[hocon] is_number_text(b: []const u8) -> bool
+    var i: usize = 0
+
+    if i < b.len && b[i] == u8('-') then i += 1
+    if i >= b.len || !b[i].is_digit() then return false
+
+    if b[i] == u8('0')
+        i += 1
+    else
+        while i < b.len && b[i].is_digit()
+            i += 1
+
+    if i < b.len && b[i] == u8('.')
+        i += 1
+
+        if i >= b.len || !b[i].is_digit() then return false
+
+        while i < b.len && b[i].is_digit()
+            i += 1
+    end if
+
+    if i < b.len && (b[i] == u8('e') || b[i] == u8('E'))
+        i += 1
+
+        if i < b.len && (b[i] == u8('+') || b[i] == u8('-')) then i += 1
+        if i >= b.len || !b[i].is_digit() then return false
+
+        while i < b.len && b[i].is_digit()
+            i += 1
+    end if
+
+    i == b.len
+end is_number_text

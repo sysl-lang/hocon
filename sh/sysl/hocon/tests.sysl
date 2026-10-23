@@ -1,0 +1,456 @@
+module sh.sysl.hocon
+@tests
+
+import sh.sysl.parsing.{Source, source_of}
+import sysl.text.str_builder
+
+// The tests read a document from text and ask it questions. A refusal is pinned as
+// `line:column message`, which is exactly what a person editing the file is told.
+
+private read(text: string) -> Value
+    parse(source_of("t.conf", text)) match
+        Ok(d) -> d.root
+        Err(d) -> panic(s"refused: ${d.message}")
+
+private read_doc(text: string) -> Document
+    parse(source_of("t.conf", text)) match
+        Ok(d) -> d
+        Err(d) -> panic(s"refused: ${d.message}")
+
+private refused(text: string) -> string
+    val src = source_of("t.conf", text)
+
+    parse(src) match
+        Ok(_) -> "read"
+        Err(d) -> s"${src.locate(d.span.start)} ${d.message}"
+
+private text_at(v: Value, path: string) -> string
+    v.at(path) match
+        Some(x) -> x.as_text() match
+            Some(t) -> t
+            None -> s"<${x.kind_name()}>"
+        None -> "<none>"
+
+private is_word(v: Value) -> bool = v.kind match
+    Word(_) -> true
+    _ -> false
+
+private located(text: string, path: string) -> string
+    val src = source_of("t.conf", text)
+    val v = parse(src).unwrap().root.at(path).unwrap()
+
+    s"${src.locate(v.span.start)}"
+
+// -- the reader the sysl compiler's manifests have always been read with --------------------------
+
+@test("a key and a quoted value")
+a_key_and_a_value()
+    assert_eq(text_at(read("name = \"geom\""), "name"), "geom")
+
+@test("a quoted value keeps a character outside ASCII as the bytes it was written in")
+a_value_keeps_unicode()
+    assert_eq(text_at(read("name = \"SDL3 — é\""), "name"), "SDL3 — é")
+    assert_eq(text_at(read("name = \"a\\\"b — c\""), "name"), "a\"b — c")
+    assert_eq(text_at(read("ключ = значение"), "ключ"), "значение")
+    assert_eq(text_at(read("label = \"LED 💡 绿\""), "label"), "LED 💡 绿")
+
+@test("a colon says what an equals says")
+a_colon_is_an_equals()
+    assert_eq(text_at(read("name : \"geom\""), "name"), "geom")
+
+@test("a block is written with or without the equals, and either way it nests")
+a_block_nests_either_way()
+    assert_eq(text_at(read("package = { name = \"a\" }"), "package.name"), "a")
+    assert_eq(text_at(read("package { name = \"a\" }"), "package.name"), "a")
+
+@test("entries are separated by a new line or a comma, and a doubled comma loses nothing")
+entries_separate_two_ways()
+    val v = read("package {\n  name = \"a\", version = 1.0.0\n}\nx = 1,, y = 2")
+
+    assert_eq(text_at(v, "package.name"), "a")
+    assert_eq(text_at(v, "package.version"), "1.0.0")
+    assert_eq(v.get("y").unwrap().as_long(), Some(2))
+
+@test("both comment spellings run to the end of their line, after a value too")
+comments_run_to_the_line_end()
+    val v = read("// a comment\nname = \"a\" // and another\n# and a third\nn = 3 # trailing\nw = a word // here")
+
+    assert_eq(text_at(v, "name"), "a")
+    assert_eq(v.get("n").unwrap().as_long(), Some(3))
+    assert_eq(text_at(v, "w"), "a word")
+    assert_eq(v.fields().len(), 3)
+
+@test("`true`, `false` and `null` are what they say, and quoted they are strings")
+flags_and_null()
+    val v = read("a = true\nb = false\nc = null\nd = \"true\"")
+
+    assert_eq(v.get("a").unwrap().as_bool(), Some(true))
+    assert_eq(v.get("b").unwrap().as_bool(), Some(false))
+    assert(v.get("c").unwrap().is_null(), "null")
+    assert_eq(text_at(v, "d"), "true")
+
+@test("a quoted key holds a dot, and is one name rather than a path")
+a_quoted_key_holds_anything()
+    val v = read("\"a.b\" = \"1\"\nx.\"y.z\".w = 2")
+
+    assert_eq(v.get("a.b").unwrap().as_text(), Some("1"))
+    assert_eq(v.get("x").unwrap().get("y.z").unwrap().get("w").unwrap().as_long(), Some(2))
+
+@test("the names an object wrote come back in the order it wrote them")
+keys_come_back_in_order()
+    val fields = read("b = 1\na = 2\nc = 3").fields()
+
+    assert_eq(fields.len(), 3)
+    assert_eq(fields.at(0).key, "b")
+    assert_eq(fields.at(1).key, "a")
+    assert_eq(fields.at(2).key, "c")
+
+@test("a list is read in order, and the keys after it still are")
+a_list_is_read()
+    val v = read("deps = [a, \"b\", c]\nname = geom")
+    val items = v.get("deps").unwrap().items()
+
+    assert_eq(items.len(), 3)
+    assert_eq(items.at(0).as_text(), Some("a"))
+    assert_eq(items.at(1).as_text(), Some("b"))
+    assert_eq(items.at(2).as_text(), Some("c"))
+    assert_eq(text_at(v, "name"), "geom")
+
+@test("a missing name answers nothing, and so does asking a string for a key")
+a_missing_key_answers_nothing()
+    val v = read("name = \"a\"")
+
+    assert(v.get("version").is_none(), "no such key")
+    assert(v.at("name.x").is_none(), "a string holds no keys")
+    assert_eq(v.get("name").unwrap().fields().len(), 0)
+
+// -- numbers and words -----------------------------------------------------------------------------
+
+@test("a bare number is a number, and a bare word that only looks like one is a word")
+numbers_and_words()
+    val v = read("a = 42\nb = -7\nc = 1.5\nd = 2e3\ne = 1.0.0\nf = 007\ng = 0x10\nh = 99999999999999999999\ni = 1.0.0+build")
+
+    assert_eq(v.get("a").unwrap().as_long(), Some(42))
+    assert_eq(v.get("b").unwrap().as_long(), Some(-7))
+    assert_eq(v.get("c").unwrap().as_real(), Some(1.5))
+    assert_eq(v.get("d").unwrap().as_real(), Some(2000.0))
+    assert(v.get("d").unwrap().as_long().is_none(), "an exponent is a real")
+    assert_eq(text_at(v, "e"), "1.0.0")
+    assert_eq(text_at(v, "f"), "007")
+    assert_eq(text_at(v, "g"), "0x10")
+    assert_eq(v.get("h").unwrap().kind_name(), "a number")
+    assert(v.get("h").unwrap().as_long().is_none(), "too large for a long is a real")
+    assert_eq(text_at(v, "i"), "1.0.0+build")
+
+@test("words written side by side are one word, and a quoted part makes the whole a string")
+words_side_by_side()
+    val v = read("a = hello   world\nb = \"x\" y\nc = 1 2")
+
+    assert_eq(v.get("a").unwrap().as_text(), Some("hello   world"))
+    assert(is_word(v.get("a").unwrap()), "a word")
+    assert(!is_word(v.get("b").unwrap()), "a string")
+    assert(is_word(v.get("c").unwrap()), "a word, not a number")
+    assert_eq(text_at(v, "b"), "x y")
+    assert_eq(v.get("c").unwrap().as_text(), Some("1 2"))
+
+// -- paths, merging and repeats --------------------------------------------------------------------
+
+@test("a dotted key nests, and two dotted keys into one object merge")
+dotted_keys_nest_and_merge()
+    val v = read("a.b.c = 1\na.b.d = 2\na.e = 3")
+
+    assert_eq(v.at("a.b.c").unwrap().as_long(), Some(1))
+    assert_eq(v.at("a.b.d").unwrap().as_long(), Some(2))
+    assert_eq(v.at("a.e").unwrap().as_long(), Some(3))
+    assert_eq(v.fields().len(), 1)
+    assert(v.fields().at(0).implied, "a dotted key's object is implied")
+
+@test("two objects under one name merge deeply, and a later plain value replaces")
+duplicate_keys_merge()
+    val v = read("a { x = 1, y { p = 1 } }\na { z = 2, y { q = 2 } }\nb = 1\nb = 2\nc { k = 1 }\nc = 5\nd = 5\nd { k = 1 }")
+
+    assert_eq(v.at("a.x").unwrap().as_long(), Some(1))
+    assert_eq(v.at("a.z").unwrap().as_long(), Some(2))
+    assert_eq(v.at("a.y.p").unwrap().as_long(), Some(1))
+    assert_eq(v.at("a.y.q").unwrap().as_long(), Some(2))
+    assert_eq(v.get("b").unwrap().as_long(), Some(2))
+    assert_eq(v.get("c").unwrap().as_long(), Some(5))
+    assert_eq(v.at("d.k").unwrap().as_long(), Some(1))
+    assert_eq(v.fields().len(), 4)
+
+@test("a name written twice is recorded with both places, and an implied one is not")
+repeats_are_recorded()
+    val text = "parts {\n  led { pin = 1 }\n  led { pin = 2 }\n}\npins.a = 1\npins.b = 2"
+    val src = source_of("t.conf", text)
+    val doc = parse(src).unwrap()
+
+    assert_eq(doc.repeats.len(), 2)
+    assert_eq(doc.repeats.at(0).path, "parts.led")
+    assert_eq(s"${src.locate(doc.repeats.at(0).first.start)}", "2:3")
+    assert_eq(s"${src.locate(doc.repeats.at(0).again.start)}", "3:3")
+    assert_eq(doc.repeats.at(1).path, "parts.led.pin")
+    assert_eq(doc.root.at("parts.led.pin").unwrap().as_long(), Some(2))
+
+@test("a repeat's path quotes a name holding a dot")
+a_repeat_path_is_quoted()
+    val doc = read_doc("\"a.b\" = 1\n\"a.b\" = 2")
+
+    assert_eq(doc.repeats.at(0).path, "\"a.b\"")
+
+// -- arrays ----------------------------------------------------------------------------------------
+
+@test("an array holds objects, arrays and values over several lines, with a trailing comma")
+arrays_of_objects()
+    val v = read("wires = [\n  { from = a, to = b }\n  { from = c, to = d },\n  [1, 2],\n]")
+    val items = v.get("wires").unwrap().items()
+
+    assert_eq(items.len(), 3)
+    assert_eq(text_at(items.at(0), "to"), "b")
+    assert_eq(text_at(items.at(1), "from"), "c")
+    assert_eq(items.at(2).items().at(1).as_long(), Some(2))
+
+@test("an empty array and an empty object")
+empty_containers()
+    val v = read("a = []\nb = {}\nc {}")
+
+    assert_eq(v.get("a").unwrap().items().len(), 0)
+    assert(v.get("b").unwrap().is_obj(), "an object")
+    assert_eq(v.get("c").unwrap().fields().len(), 0)
+
+// -- strings ---------------------------------------------------------------------------------------
+
+@test("a triple-quoted string runs over lines and escapes nothing")
+multiline_strings()
+    val v = read("a = \"\"\"line one\n  line \"two\" \\n\"\"\"\nb = \"\"\"\"x\"\"\"\"\nc = \"\"\"\"\"\"")
+
+    assert_eq(text_at(v, "a"), "line one\n  line \"two\" \\n")
+    assert_eq(text_at(v, "b"), "\"x\"")
+    assert_eq(text_at(v, "c"), "")
+
+@test("JSON's escapes are read, a surrogate pair is one character, and nothing else is an escape")
+escapes()
+    val v = read("a = \"t\\tn\\nq\\\"s\\\\/\\/u\\u0041\"\nb = \"\\ud83d\\ude00\"")
+
+    assert_eq(text_at(v, "a"), "t\tn\nq\"s\\//uA")
+    assert_eq(text_at(v, "b"), "😀")
+    assert_eq(refused("a = \"\\x41\""), "1:6 not one of HOCON's escapes")
+    assert_eq(refused("a = \"\\u{41}\""), "1:6 not one of HOCON's escapes")
+    assert_eq(refused("a = \"\\ud83d\""), "1:6 not a character escape")
+
+@test("a quoted string ends on its own line, and one never closed says where it began")
+unterminated_strings()
+    assert_eq(refused("a = \"abc\nb = 1"), "1:5 unterminated string")
+    assert_eq(refused("a = \"abc"), "1:5 unterminated string")
+    assert_eq(refused("x = 1\na = \"\"\"abc\n"), "2:5 unterminated multi-line string")
+
+// -- substitutions ---------------------------------------------------------------------------------
+
+@test("a substitution is the value its path names, whatever it is")
+substitutions_resolve()
+    val v = read("base { pin = 16, color = red }\nled = ${base}\nn = ${base.pin}\nc = ${n}\nlist = [${n}, 2]")
+
+    assert_eq(v.at("led.color").unwrap().as_text(), Some("red"))
+    assert_eq(v.get("n").unwrap().as_long(), Some(16))
+    assert_eq(v.get("c").unwrap().as_long(), Some(16))
+    assert_eq(v.get("list").unwrap().items().at(0).as_long(), Some(16))
+
+@test("a substitution may name a later key, and a path through another substitution")
+substitutions_reach_forward_and_through()
+    val v = read("a = ${b.c}\nb = ${d}\nd { c = 7 }\nq = ${\"x.y\"}\n\"x.y\" = 1")
+
+    assert_eq(v.get("a").unwrap().as_long(), Some(7))
+    assert_eq(v.at("b.c").unwrap().as_long(), Some(7))
+    assert_eq(v.get("q").unwrap().as_long(), Some(1))
+
+@test("an optional substitution that names nothing leaves its field unset")
+optional_substitutions()
+    val v = read("a = ${?missing}\nb = x${?missing}y\nc = 1\nc = ${?missing}")
+
+    assert(v.get("a").is_none(), "unset")
+    assert_eq(text_at(v, "b"), "xy")
+    assert_eq(v.get("c").unwrap().as_long(), Some(1))
+
+@test("optional substitutions that all name nothing leave the field unset, and drop out of an array")
+optional_substitutions_vanish()
+    val v = read("a = ${?x}${?y}\nxs = [1, ${?x}, 3]\nb { c = ${?x} }")
+
+    assert(v.get("a").is_none(), "unset")
+    assert_eq(v.get("xs").unwrap().items().len(), 2)
+    assert_eq(v.get("b").unwrap().fields().len(), 0)
+
+@test("a substitution that names nothing is refused where it was written")
+missing_substitution()
+    assert_eq(refused("a = 1\nb = ${nope.x}"), "2:5 no value at `${nope.x}`")
+    assert_eq(refused("a = \"s\"\nb = ${a.x}"), "2:5 no value at `${a.x}`")
+
+@test("a substitution that needs its own value is a cycle, and so is a self-reference")
+substitution_cycles()
+    assert_eq(refused("a = ${b}\nb = ${a}"), "2:5 a substitution cycle: `${a}` needs its own value")
+    assert_eq(refused("a { b = ${a} }"), "1:9 a substitution cycle: `${a}` needs its own value")
+    assert_eq(refused("p = x\np = ${p}y"), "2:5 a substitution cycle: `${p}` needs its own value")
+
+@test("text and substitutions side by side are one string, with numbers as written")
+string_concatenation()
+    val v = read("major = 1\nminor = 0\nv = ${major}.${minor}\ndir = /usr\nbin = ${dir}/bin and \"more\"")
+
+    assert_eq(text_at(v, "v"), "1.0")
+    assert_eq(text_at(v, "bin"), "/usr/bin and more")
+
+@test("objects side by side merge, arrays side by side join, and the two do not mix")
+object_and_array_concatenation()
+    val v = read("led { color = red, pin = 1 }\nd1 = ${led} { pin = 16 }\nxs = [1, 2]\nys = ${xs} [3]")
+
+    assert_eq(text_at(v, "d1.color"), "red")
+    assert_eq(v.at("d1.pin").unwrap().as_long(), Some(16))
+    assert_eq(v.at("led.pin").unwrap().as_long(), Some(1))
+    assert_eq(v.get("ys").unwrap().items().len(), 3)
+    assert_eq(refused("o { a = 1 }\nx = ${o} [1]"), "2:10 cannot concatenate an object with an array")
+    assert_eq(refused("o { a = 1 }\nx = ${o} word"), "2:10 cannot concatenate an object with a string")
+    assert_eq(refused("s = w\nx = ${s} { a = 1 }"), "2:10 cannot concatenate a string with an object")
+
+@test("a key set to an object and then a substitution of one merges the two")
+merge_through_a_substitution()
+    val v = read("base { a = 1, b = 2 }\nx { a = 0, c = 3 }\nx = ${base}\nx.b = 9")
+
+    assert_eq(v.at("x.a").unwrap().as_long(), Some(1))
+    assert_eq(v.at("x.b").unwrap().as_long(), Some(9))
+    assert_eq(v.at("x.c").unwrap().as_long(), Some(3))
+
+@test("an unclosed substitution and a dollar on its own are refused")
+substitution_syntax()
+    assert_eq(refused("a = ${b"), "1:8 expected '}' to close the substitution")
+    assert_eq(refused("a = ${}"), "1:7 expected a path in the substitution")
+    assert_eq(refused("a = $b"), "1:5 expected a value")
+
+// -- what is refused -------------------------------------------------------------------------------
+
+@test("include is refused by name, and a key called include is a key")
+include_is_refused()
+    assert_eq(refused("include \"other.conf\""), "1:1 `include` is not supported")
+    assert_eq(refused("a = 1\ninclude file(\"x\")"), "2:1 `include` is not supported")
+    assert_eq(text_at(read("include = yes"), "include"), "yes")
+
+@test("`+=` is refused by name")
+plus_equals_is_refused()
+    assert_eq(refused("a = [1]\na += 2"), "2:3 `+=` is not supported")
+
+@test("the positions of the structural mistakes")
+structural_mistakes()
+    assert_eq(refused("package { name = \"a\""), "1:9 unclosed object — expected '}'")
+    assert_eq(refused("a = [1, 2"), "1:5 unclosed array — expected ']'")
+    assert_eq(refused("}"), "1:1 a '}' closes an object that was never opened")
+    assert_eq(refused("name \"a\""), "1:6 expected '=', ':' or '{' after the key `name`")
+    assert_eq(refused("name"), "1:5 expected '=', ':' or '{' after the key `name`")
+    assert_eq(refused("a = 1 b = 2"), "1:9 expected ',' or a new line after the value of `a`")
+    assert_eq(refused("a = ,"), "1:5 expected a value")
+    assert_eq(refused("a =\n"), "1:4 expected a value")
+    assert_eq(refused("a = [1 2 = 3]"), "1:10 expected ',' or a new line after an array element")
+    assert_eq(refused("{ a = 1 } x"), "1:11 unexpected text after the end of the document")
+    assert_eq(refused("a..b = 1"), "1:3 expected a key")
+    assert_eq(refused("= 1"), "1:1 expected a key")
+    assert_eq(refused("a b = 1"), "1:3 expected '=', ':' or '{' after the key `a`")
+    assert_eq(refused("a. = 1"), "1:3 expected a key")
+    assert_eq(refused("a = 1\n  [x]"), "2:3 expected a key")
+
+// -- the shape of a document -----------------------------------------------------------------------
+
+@test("an empty document, and one of only comments, is an empty object")
+empty_documents()
+    assert_eq(read("").fields().len(), 0)
+    assert_eq(read("\n  \n# nothing\n// at all\n").fields().len(), 0)
+    assert_eq(read_doc("").repeats.len(), 0)
+
+@test("the root may be written in braces, may be an array, and a byte-order mark is passed over")
+root_forms()
+    assert_eq(read("{ a = 1 }").get("a").unwrap().as_long(), Some(1))
+    assert_eq(read("[1, 2]").items().len(), 2)
+    assert_eq(read("\u{feff}a = 1").get("a").unwrap().as_long(), Some(1))
+
+@test("Windows line endings separate entries as a new line does")
+crlf_line_endings()
+    val v = read("a = 1\r\nb = two\r\nc { d = 3 }\r\n")
+
+    assert_eq(v.get("a").unwrap().as_long(), Some(1))
+    assert_eq(text_at(v, "b"), "two")
+    assert_eq(v.at("c.d").unwrap().as_long(), Some(3))
+
+@test("every value and key knows its line and column, counted in characters")
+spans_locate()
+    val text = "a {\n  b = 12\n  \"ü\" = [x]\n}\nc = ${a.b}"
+
+    assert_eq(located(text, "a"), "1:3")
+    assert_eq(located(text, "a.b"), "2:7")
+    assert_eq(located(text, "c"), "2:7")
+
+    val src = source_of("t.conf", text)
+    val a = parse(src).unwrap().root.get("a").unwrap()
+    val f = a.field("ü").unwrap()
+
+    assert_eq(s"${src.locate(f.key_span.start)}", "3:3")
+    assert_eq(s"${src.locate(f.value.span.start)}", "3:9")
+
+// -- writing back ----------------------------------------------------------------------------------
+
+private round_trips(text: string) -> bool
+    val first = read(text)
+    val again = read(render(first))
+
+    same(first, again)
+
+@test("a document written back reads as the same tree")
+render_round_trips()
+    assert(round_trips("a = 1\nb = 1.5\nc = 1.0\nd = word\ne = \"two words\"\nf = true\ng = null"), "scalars")
+    assert(round_trips("\"a.b\" = 1\n\"\" = 2\n\"with space\" { x = \"q\\\"\\n\\t\\u0001\" }"), "keys")
+    assert(round_trips("xs = [1, [2, 3], { a = b }]\nys = []\nzs {}"), "nesting")
+    assert(round_trips("u = \"é 💡 绿\"\nw = \"1.5\"\nv = \"true\"\nt = \"#123\""), "strings that must stay quoted")
+    assert(round_trips("w = hello world"), "a word with a space")
+
+@test("the rendering is the layout a person writes")
+render_layout()
+    assert_eq(render(read("a { b = 1, c = [x, y] }\nd = \"q\"")), "a {\n  b = 1\n  c = [x, y]\n}\nd = \"q\"\n")
+
+@test("the unresolved tree keeps its substitutions, and renders them")
+unresolved_tree()
+    val doc = parse_unresolved(source_of("t.conf", "a = ${?b.c}\nd = ${a}x")).unwrap()
+
+    assert_eq(render(doc.root), "a = ${?b.c}\nd = ${a}x\n")
+
+@test("same() tells trees apart by every kind")
+same_tells_apart()
+    assert(!same(read("a = 1"), read("a = 2")), "numbers")
+    assert(!same(read("a = 1"), read("a = \"1\"")), "a number and a string")
+    assert(!same(read("a = x"), read("a = \"x\"")), "a word and a string")
+    assert(!same(read("a = 1\nb = 2"), read("b = 2\na = 1")), "order")
+    assert(same(read("a { b = 1 }"), read("a.b = 1")), "a dotted key is the same tree")
+
+@test("the README's two examples say what they claim")
+readme_examples()
+    val src = source_of("board.hocon", "led { pin = 16, color = green }\nd1 = ${led} { label = \"D1\" }")
+    val d1 = parse(src).unwrap().root.get("d1").unwrap()
+
+    assert_eq(d1.get("color").unwrap().as_text(), Some("green"))
+    assert_eq(s"${src.locate(d1.get("pin").unwrap().span.start)}", "1:13")
+
+    val bad = source_of("board.hocon", "parts {\n  d1 {\n    part = led\n    pin = GP16 colour = red\n  }\n}")
+
+    parse(bad) match
+        Ok(_) -> panic("read")
+        Err(d) ->
+            assert_eq(d.render(bad), "error: expected ',' or a new line after the value of `pin`\n --> board.hocon:4:23\n  |\n4 |     pin = GP16 colour = red\n  |                       ^ found `=`\n")
+
+// -- size ------------------------------------------------------------------------------------------
+
+@test("a large document reads, resolves and renders")
+a_large_document()
+    var b = str_builder()
+
+    b.push("base { kind = led, color = red }\n")
+
+    for i in 0..<3000
+        b.push(s"part$i = $${base} { pin = $i, label = \"P$i\" }\n")
+
+    val v = read(b.finish())
+
+    assert_eq(v.fields().len(), 3001)
+    assert_eq(v.at("part2999.pin").unwrap().as_long(), Some(2999))
+    assert_eq(text_at(v, "part1500.color"), "red")

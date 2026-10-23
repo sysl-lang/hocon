@@ -1,0 +1,32 @@
+// HOCON, read into a tree that remembers where every value was written, for sysl.
+//
+// A document reads into a value that owns itself -- an object is a `Buf[Field]` and an array a
+// `Buf[Value]` -- and every value and every key carries its `Span`, so a program checking a file it
+// read can point at the line that is wrong. Substitutions (`${a.b}`, `${?a.b}`), concatenation,
+// merging and triple-quoted strings are read; `include` and `+=` are refused by name.
+//
+// This is the block a consumer writes to reach it:
+//
+//     dependencies {
+//       hocon { git = "github.com/sysl-lang/hocon", version = "0.1.0" }
+//     }
+//
+// The coordinate names the package, `hocon`; the module a program imports is `sh.sysl.hocon`. Naming
+// the coordinate alone is enough to import `sh.sysl.parsing` too, since imports are transitive --
+// which a caller needs, because `parse` takes a `Source` and answers with a `Diagnostic`.
+
+package {
+  name    = "hocon"
+  version = "0.1.0"
+  sysl    = "0.5.0"
+}
+
+dependencies {
+  parsing { git = "github.com/sysl-lang/parsing", version = "0.13.0" }
+}
+
+// A document's size is not known until it has been read, so the tree is built on the heap. Nothing
+// here opens a file: a `Source` is made over text the caller already has.
+requires {
+  heap = true
+}
