@@ -8,7 +8,7 @@
 // This is the block a consumer writes to reach it:
 //
 //     dependencies {
-//       hocon { git = "github.com/sysl-lang/hocon", version = "0.1.0" }
+//       hocon { git = "github.com/sysl-lang/hocon", version = "0.2.0" }
 //     }
 //
 // The coordinate names the package, `hocon`; the module a program imports is `sh.sysl.hocon`. Naming
