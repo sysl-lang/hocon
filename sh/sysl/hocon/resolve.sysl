@@ -2,7 +2,7 @@ module sh.sysl.hocon
 
 import sh.sysl.parsing.{Diagnostic, Source, Span, error}
 import sysl.buf.{Buf, buf}
-import sysl.text.{from_utf8_unchecked, str_builder}
+import sysl.text.str_builder
 
 // Substitutions, concatenations and merges, replaced by what they come to.
 //
@@ -228,14 +228,8 @@ private text_of(r: *Resolver, v: Value) -> string
         Word(s) -> s
         Bool(b) -> if b then "true" else "false"
         Null -> "null"
-        Int(n) -> written(r, v.span, str(n))
-        Real(x) -> written(r, v.span, str(x))
-        _ -> ""
+        _ -> v.as_word().unwrap_or("")
 end text_of
-
-private written(r: *Resolver, span: Span, fallback: string) -> string =
-    if span.end <= r.src.bytes.len && span.end > span.start then from_utf8_unchecked(r.src.bytes[span.start..<span.end])
-    else fallback
 
 /** Two objects as one, the second on top: a field in both that is an object in both is merged in
  * turn, and any other field of the second replaces the first's. The result is a new tree; neither

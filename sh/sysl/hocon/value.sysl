@@ -100,15 +100,95 @@ struct Value
 
     as_long(self) -> Option[long]
         self.kind match
-            Int(n) -> Some(n)
+            Int(n, _) -> Some(n)
             _ -> None
 
     /** A number of either kind, as a real. */
     as_real(self) -> Option[real]
         self.kind match
-            Int(n) -> Some(real(n))
-            Real(x) -> Some(x)
+            Int(n, _) -> Some(real(n))
+            Real(x, _) -> Some(x)
             _ -> None
+
+    /** The text of a quoted string, and `None` for anything else -- an unquoted word included. */
+    as_quoted(self) -> Option[string]
+        self.kind match
+            Str(s) -> Some(s)
+            _ -> None
+
+    /** The text of an unquoted value other than `true` or `false`, exactly as it was written: a word,
+     * a number (`0.10` stays `0.10`), or `null`. `None` for a quoted string, a boolean, an object or
+     * an array.
+     *
+     * This is the question a format asks when a key's answer is a word it interprets itself -- a
+     * version `1.2`, a size `64k`, an integer wider than a `long` -- and where `"3"` and `3` must stay
+     * different answers.
+     */
+    as_word(self) -> Option[string]
+        self.kind match
+            Word(s) -> Some(s)
+            Int(n, w) -> Some(if w.is_empty() then str(n) else w)
+            Real(x, w) -> Some(if w.is_empty() then real_text(x) else w)
+            Null -> Some("null")
+            _ -> None
+
+    /** Any scalar as the text it was written as: a string quoted or not, a number as written,
+     * `true`, `false`, `null`. `None` for an object or an array.
+     */
+    as_scalar(self) -> Option[string]
+        self.kind match
+            Str(s) -> Some(s)
+            Bool(b) -> Some(if b then "true" else "false")
+            _ -> self.as_word()
+
+    /** The scalar an object holds under a name, as `as_scalar` gives it -- `None` for a name it does
+     * not hold, for one holding an object or an array, and for a value that is not an object.
+     */
+    scalar_at(self, key: string) -> Option[string]
+        self.get(key) match
+            Some(v) -> v.as_scalar()
+            None -> None
+
+    /** An array whose every element is a string or a word, as their texts in order. `None` for any
+     * other value, and for an array holding a boolean, an object or an array.
+     */
+    as_text_list(self) -> Option[Buf[string]]
+        var out: Buf[string] = buf()
+
+        self.kind match
+            Arr(items) ->
+                for item in items
+                    item.kind match
+                        Str(s) -> out.push(s)
+                        _ -> item.as_word() match
+                            Some(w) -> out.push(w)
+                            None -> return None
+            _ -> return None
+
+        Some(out)
+    end as_text_list
+
+    /** An object's names in the order they were written, or none. */
+    keys(self) -> Buf[string]
+        var out: Buf[string] = buf()
+
+        for f in self.fields()
+            out.push(f.key)
+
+        out
+    end keys
+
+    /** Every field of an object that holds a boolean, as its name and the boolean, in order. */
+    flags(self) -> Buf[(string, bool)]
+        var out: Buf[(string, bool)] = buf()
+
+        for f in self.fields()
+            f.value.as_bool() match
+                Some(on) -> out.push((f.key, on))
+                None -> ()
+
+        out
+    end flags
 
     as_bool(self) -> Option[bool]
         self.kind match
@@ -133,8 +213,8 @@ struct Value
         Arr(_) -> "an array"
         Str(_) -> "a string"
         Word(_) -> "a string"
-        Int(_) -> "a number"
-        Real(_) -> "a number"
+        Int(_, _) -> "a number"
+        Real(_, _) -> "a number"
         Bool(_) -> "a boolean"
         Null -> "null"
         Subst(_, _) -> "a substitution"
@@ -159,8 +239,11 @@ enum Kind
     Arr(items: Buf[Value])
     Str(s: string)
     Word(s: string)
-    Int(n: long)
-    Real(x: real)
+    // A number keeps the text it was written as, which HOCON asks for and the value alone cannot
+    // give back: `0.10` is the real 0.1, and `18446744073709551616` is past what a `long` holds.
+    // `written` may be empty for a number a program built, and `render` then spells the value.
+    Int(n: long, written: string)
+    Real(x: real, written: string)
     Bool(b: bool)
     Null
     // `${a.b}`, or `${?a.b}` where `optional` -- the path is its segments.
@@ -189,6 +272,20 @@ struct Document
     root: Value
     repeats: Buf[Repeat]
 
+/** An object a program builds, its fields in the order given. Each name is given the span of its
+ * value, and the object the span from its first value to its last -- an empty span where it has none.
+ */
+object_of(fields: Buf[(string, Value)]) -> Value
+    var out: Buf[Field] = buf()
+
+    for f in fields
+        out.push(Field(f.0, f.1.span, f.1, false))
+
+    val span = if fields.is_empty() then Span(0, 0) else fields.at(0).1.span.to(fields.at(fields.len() - 1).1.span)
+
+    Value(span, Obj(out))
+end object_of
+
 /** Whether two values are the same tree, whatever spans they were read from. */
 same(a: Value, b: Value) -> bool
     a.kind match
@@ -213,11 +310,11 @@ same(a: Value, b: Value) -> bool
         Word(s) -> b.kind match
             Word(t) -> s == t
             _ -> false
-        Int(n) -> b.kind match
-            Int(m) -> n == m
+        Int(n, _) -> b.kind match
+            Int(m, _) -> n == m
             _ -> false
-        Real(x) -> b.kind match
-            Real(y) -> x == y
+        Real(x, _) -> b.kind match
+            Real(y, _) -> x == y
             _ -> false
         Bool(p) -> b.kind match
             Bool(q) -> p == q
@@ -333,8 +430,8 @@ private render_value(b: *StrBuilder, v: Value, depth: int)
                 b.push("]")
         Str(s) -> b.push(quoted(s))
         Word(s) -> b.push(if bare_word(s) then s else quoted(s))
-        Int(n) -> b.push(str(n))
-        Real(x) -> b.push(real_text(x))
+        Int(n, w) -> b.push(if w.is_empty() then str(n) else w)
+        Real(x, w) -> b.push(if w.is_empty() then real_text(x) else w)
         Bool(on) -> b.push(if on then "true" else "false")
         Null -> b.push("null")
         Subst(p, optional) ->

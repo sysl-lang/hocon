@@ -1,7 +1,8 @@
 module sh.sysl.hocon
 @tests
 
-import sh.sysl.parsing.{Source, source_of}
+import sh.sysl.parsing.{Source, point, source_of}
+import sysl.buf.{Buf, buf}
 import sysl.text.str_builder
 
 // The tests read a document from text and ask it questions. A refusal is pinned as
@@ -30,6 +31,28 @@ private text_at(v: Value, path: string) -> string
             Some(t) -> t
             None -> s"<${x.kind_name()}>"
         None -> "<none>"
+
+// The note under a refusal, which says where an unclosed thing was opened.
+private note_of(text: string) -> string
+    parse(source_of("t.conf", text)) match
+        Ok(_) -> "read"
+        Err(d) -> d.note
+
+// An array's texts joined by spaces, or what stopped it being a list of texts.
+private text_at_list(v: Value, key: string) -> string
+    v.get(key) match
+        None -> "<none>"
+        Some(x) -> x.as_text_list() match
+            None -> "<not a list of texts>"
+            Some(xs) ->
+                var b = str_builder()
+
+                for i in 0..<xs.len()
+                    if i > 0 then b.push(" ")
+
+                    b.push(xs.at(i))
+
+                b.finish()
 
 private is_word(v: Value) -> bool = v.kind match
     Word(_) -> true
@@ -240,7 +263,9 @@ escapes()
 @test("a quoted string ends on its own line, and one never closed says where it began")
 unterminated_strings()
     assert_eq(refused("a = \"abc\nb = 1"), "1:5 unterminated string")
-    assert_eq(refused("a = \"abc"), "1:5 unterminated string")
+    assert_eq(refused("a = \"abc"), "1:9 a quoted string was opened and never closed")
+    assert_eq(note_of("a = \"abc"), "the '\"' at line 1, column 5 is never closed")
+    assert_eq(refused("\"abc = 1"), "1:9 a quoted string was opened and never closed")
     assert_eq(refused("x = 1\na = \"\"\"abc\n"), "2:5 unterminated multi-line string")
 
 // -- substitutions ---------------------------------------------------------------------------------
@@ -320,7 +345,7 @@ merge_through_a_substitution()
 substitution_syntax()
     assert_eq(refused("a = ${b"), "1:8 expected '}' to close the substitution")
     assert_eq(refused("a = ${}"), "1:7 expected a path in the substitution")
-    assert_eq(refused("a = $b"), "1:5 expected a value")
+    assert_eq(refused("a = $b"), "1:5 a value was expected")
 
 // -- what is refused -------------------------------------------------------------------------------
 
@@ -336,21 +361,72 @@ plus_equals_is_refused()
 
 @test("the positions of the structural mistakes")
 structural_mistakes()
-    assert_eq(refused("package { name = \"a\""), "1:9 unclosed object — expected '}'")
-    assert_eq(refused("a = [1, 2"), "1:5 unclosed array — expected ']'")
-    assert_eq(refused("}"), "1:1 a '}' closes an object that was never opened")
-    assert_eq(refused("name \"a\""), "1:6 expected '=', ':' or '{' after the key `name`")
-    assert_eq(refused("name"), "1:5 expected '=', ':' or '{' after the key `name`")
+    assert_eq(refused("package { name = \"a\""), "1:21 unclosed object — expected '}'")
+    assert_eq(refused("a = [1, 2"), "1:10 a '[' was opened and never closed")
+    assert_eq(refused("}"), "1:1 a '}' closes a block that was never opened")
+    assert_eq(refused("a { b = 1 } }"), "1:13 a '}' closes a block that was never opened")
+    assert_eq(refused("name \"a\""), "1:6 'name' is followed by '\"' rather than '=' or a block")
+    assert_eq(refused("name"), "1:5 'name' names nothing")
     assert_eq(refused("a = 1 b = 2"), "1:9 expected ',' or a new line after the value of `a`")
-    assert_eq(refused("a = ,"), "1:5 expected a value")
-    assert_eq(refused("a =\n"), "1:4 expected a value")
-    assert_eq(refused("a = [1 2 = 3]"), "1:10 expected ',' or a new line after an array element")
+    assert_eq(refused("a = ,"), "1:5 a value was expected")
+    assert_eq(refused("a =\n"), "2:1 a value was expected")
+    assert_eq(refused("a =   # nothing yet"), "1:20 a value was expected")
+    assert_eq(refused("a = [1 2 = 3]"), "1:10 unexpected token in value")
     assert_eq(refused("{ a = 1 } x"), "1:11 unexpected text after the end of the document")
-    assert_eq(refused("a..b = 1"), "1:3 expected a key")
-    assert_eq(refused("= 1"), "1:1 expected a key")
-    assert_eq(refused("a b = 1"), "1:3 expected '=', ':' or '{' after the key `a`")
-    assert_eq(refused("a. = 1"), "1:3 expected a key")
-    assert_eq(refused("a = 1\n  [x]"), "2:3 expected a key")
+    assert_eq(refused("a..b = 1"), "1:3 '.' cannot begin a key")
+    assert_eq(refused("= 1"), "1:1 '=' cannot begin a key")
+    assert_eq(refused("a b = 1"), "1:3 'a' is followed by 'b' rather than '=' or a block")
+    assert_eq(refused("a. = 1"), "1:3 ' ' cannot begin a key")
+    assert_eq(refused("a = 1\n  [x]"), "2:3 '[' cannot begin a key")
+
+@test("an unclosed object, array or string is reported where the input ends, with a note naming the opener")
+unclosed_at_the_end()
+    assert_eq(refused("a {\n  b = 1\n"), "3:1 unclosed object — expected '}'")
+    assert_eq(note_of("a {\n  b = 1\n"), "the '{' at line 1, column 3 is never closed")
+    assert_eq(refused("{ a = 1"), "1:8 unclosed object — expected '}'")
+    assert_eq(note_of("{ a = 1"), "the '{' at line 1, column 1 is never closed")
+    assert_eq(note_of("x = [\n  1\n"), "the '[' at line 1, column 5 is never closed")
+    assert_eq(refused("a { b = [1"), "1:11 a '[' was opened and never closed")
+    assert_eq(refused("a = { b = \"x"), "1:13 a quoted string was opened and never closed")
+
+    // The note counts characters, as `locate` does, while the reader stopped at the end.
+    assert_eq(note_of("é = {"), "the '{' at line 1, column 5 is never closed")
+
+@test("a binding inside braces with nothing after it is the object never closed; at the root it is a missing value")
+binding_with_nothing_after_it()
+    assert_eq(refused("targets { default = \n"), "2:1 unclosed object — expected '}'")
+    assert_eq(refused("package { name = "), "1:18 unclosed object — expected '}'")
+    assert_eq(refused("a { b : // still typing"), "1:24 unclosed object — expected '}'")
+    assert_eq(refused("a { b = \n}"), "1:9 a value was expected")
+    assert_eq(refused("a = "), "1:5 a value was expected")
+
+    // A value on the next line is not this binding's value: the binding has none.
+    assert_eq(refused("a =\nb = 1"), "1:4 a value was expected")
+
+@test("a key with nothing after it, or followed by something else, is named as it was spelled")
+key_refusals_name_the_key()
+    assert_eq(refused("a { b"), "1:6 'b' names nothing")
+    assert_eq(refused("requires.headers."), "1:18 'requires.headers.' names nothing")
+    assert_eq(refused("a { b.  "), "1:9 'b.' names nothing")
+    assert_eq(refused("a. b = 1"), "1:3 ' ' cannot begin a key")
+    assert_eq(refused("a.b \"x\""), "1:5 'a.b' is followed by '\"' rather than '=' or a block")
+    assert_eq(refused("\"a.b\" x"), "1:7 'a.b' is followed by 'x' rather than '=' or a block")
+    assert_eq(refused("name é"), "1:6 'name' is followed by 'é' rather than '=' or a block")
+    assert_eq(refused("name\n= 1"), "1:5 'name' is followed by a new line rather than '=' or a block")
+    assert_eq(refused("a { @ = 1 }"), "1:5 '@' cannot begin a key")
+    assert_eq(read("a { é = 1 }").get("a").unwrap().scalar_at("é"), Some("1"))
+    assert_eq(refused("a = 1\n\"\" x"), "2:4 '' is followed by 'x' rather than '=' or a block")
+
+@test("a key or separator inside an array element is an unexpected token, quoted or not")
+separator_inside_an_array()
+    assert_eq(refused("features { server = [dep:lmdb] }"), "1:25 unexpected token in value")
+    assert_eq(refused("a = [\"dep\":lmdb]"), "1:11 unexpected token in value")
+    assert_eq(refused("a = [x = 1]"), "1:8 unexpected token in value")
+    assert_eq(refused("a = [x,\n  y : 2]"), "2:5 unexpected token in value")
+    assert_eq(text_at_list(read("a = [\"dep:lmdb\", \"x=1\"]"), "a"), "dep:lmdb x=1")
+
+    // Outside an array a colon is the separator it always was.
+    assert_eq(text_at(read("a : x"), "a"), "x")
 
 // -- the shape of a document -----------------------------------------------------------------------
 
@@ -388,6 +464,144 @@ spans_locate()
 
     assert_eq(s"${src.locate(f.key_span.start)}", "3:3")
     assert_eq(s"${src.locate(f.value.span.start)}", "3:9")
+
+// -- what a format built on HOCON asks of a value -----------------------------------------------------
+
+@test("a number keeps the text it was written as, whatever value it reads to")
+numbers_keep_their_text()
+    val v = read("a = 0.10\nb = -12\nc = 1e3\nd = -0\ne = 18446744073709551616\nf = 12\ng = 007")
+
+    assert_eq(v.get("a").unwrap().as_word(), Some("0.10"))
+    assert_eq(v.get("a").unwrap().as_real(), Some(0.1))
+    assert_eq(v.get("b").unwrap().as_word(), Some("-12"))
+    assert_eq(v.get("b").unwrap().as_long(), Some(-12))
+
+    // Not a JSON number, so a word -- with the same text.
+    assert_eq(v.get("g").unwrap().as_word(), Some("007"))
+    assert_eq(v.get("g").unwrap().as_long(), None)
+    assert_eq(v.get("c").unwrap().as_word(), Some("1e3"))
+    assert_eq(v.get("d").unwrap().as_word(), Some("-0"))
+
+    // Past a `long`: a real by value, and still every digit as text.
+    assert_eq(v.get("e").unwrap().as_long(), None)
+    assert_eq(v.get("e").unwrap().as_word(), Some("18446744073709551616"))
+    assert_eq(v.get("f").unwrap().as_word(), Some("12"))
+
+    // Written back as written; compared by value.
+    assert_eq(render(read("a = 0.10\nb = 007")), "a = 0.10\nb = 007\n")
+    assert(same(read("a = 1.0"), read("a = 1.00")), "one real, two spellings")
+    assert(!same(read("a = 1"), read("a = 1.0")), "an integer is not a real")
+
+@test("a number from a substitution or inside a concatenation keeps its text too")
+numbers_keep_their_text_through_resolution()
+    val v = read("a = 0.50\nb = ${a}\nc = v${a}")
+
+    assert_eq(v.get("b").unwrap().as_word(), Some("0.50"))
+    assert_eq(v.get("c").unwrap().as_text(), Some("v0.50"))
+
+@test("a number a program built, with no text, is spelled from its value")
+built_numbers_spell_themselves()
+    val n = Value(point(0), Int(42, ""))
+    val x = Value(point(0), Real(2.0, ""))
+
+    assert_eq(n.as_word(), Some("42"))
+    assert_eq(x.as_word(), Some("2.0"))
+    assert_eq(render(x), "2.0\n")
+
+@test("as_word answers an unquoted value's text, and nothing for a string, a boolean or a block")
+as_word_kinds()
+    val v = read("w = hello world\ns = \"q\"\nt = true\nn = null\nv = 1.2.3\no { }\na = [1]")
+
+    assert_eq(v.get("w").unwrap().as_word(), Some("hello world"))
+    assert_eq(v.get("s").unwrap().as_word(), None)
+    assert_eq(v.get("t").unwrap().as_word(), None)
+    assert_eq(v.get("n").unwrap().as_word(), Some("null"))
+    assert_eq(v.get("v").unwrap().as_word(), Some("1.2.3"))
+    assert_eq(v.get("o").unwrap().as_word(), None)
+    assert_eq(v.get("a").unwrap().as_word(), None)
+
+@test("as_quoted answers a quoted string's text only, so `3` and `\"3\"` stay two answers")
+as_quoted_kinds()
+    val v = read("s = \"3\"\nw = 3\nx = word\nt = \"a\" b\nb = true\no { }")
+
+    assert_eq(v.get("s").unwrap().as_quoted(), Some("3"))
+    assert_eq(v.get("w").unwrap().as_quoted(), None)
+    assert_eq(v.get("x").unwrap().as_quoted(), None)
+    assert_eq(v.get("t").unwrap().as_quoted(), Some("a b"))
+    assert_eq(v.get("b").unwrap().as_quoted(), None)
+    assert_eq(v.get("o").unwrap().as_quoted(), None)
+
+@test("as_scalar and scalar_at answer any scalar as written, and nothing for a block or a missing name")
+scalars_as_text()
+    val v = read("s = \"3\"\nw = 3.0\nt = true\nf = false\nn = null\no { x = 1 }\na = [1]")
+
+    assert_eq(v.scalar_at("s"), Some("3"))
+    assert_eq(v.scalar_at("w"), Some("3.0"))
+    assert_eq(v.scalar_at("t"), Some("true"))
+    assert_eq(v.scalar_at("f"), Some("false"))
+    assert_eq(v.scalar_at("n"), Some("null"))
+    assert_eq(v.scalar_at("o"), None)
+    assert_eq(v.scalar_at("a"), None)
+    assert_eq(v.scalar_at("missing"), None)
+    assert_eq(v.get("s").unwrap().scalar_at("x"), None)
+    assert_eq(v.get("o").unwrap().as_scalar(), None)
+
+@test("as_text_list reads an array of strings and words, and refuses any other array or value")
+text_lists()
+    val v = read("a = [\"x\", y, 3, 0.10, null]\nb = [x, true]\nc = [x, [y]]\nd = [x, { y = 1 }]\ne = []\nf = x")
+
+    assert_eq(text_at_list(v, "a"), "x y 3 0.10 null")
+    assert_eq(text_at_list(v, "b"), "<not a list of texts>")
+    assert_eq(text_at_list(v, "c"), "<not a list of texts>")
+    assert_eq(text_at_list(v, "d"), "<not a list of texts>")
+    assert_eq(text_at_list(v, "e"), "")
+    assert_eq(text_at_list(v, "f"), "<not a list of texts>")
+
+@test("keys come back in the order written, merged names once, and none from a value that is not an object")
+keys_in_order()
+    val v = read("b = 1\na { x = 1 }\nc = 2\na { y = 2 }\na.z = 3")
+    val keys = v.keys()
+
+    assert_eq(keys.len(), 3)
+    assert_eq(s"${keys.at(0)} ${keys.at(1)} ${keys.at(2)}", "b a c")
+
+    val inner = v.get("a").unwrap().keys()
+
+    assert_eq(s"${inner.len()} ${inner.at(0)} ${inner.at(1)} ${inner.at(2)}", "3 x y z")
+    assert_eq(v.get("b").unwrap().keys().len(), 0)
+    assert_eq(read("[1, 2]").keys().len(), 0)
+
+@test("flags are an object's boolean fields in order, and nothing else in it")
+flags_in_order()
+    val v = read("requires { heap = true, os = false, name = \"x\", n = 1, \"t\" = \"true\", fs = true }")
+    val flags = v.get("requires").unwrap().flags()
+
+    assert_eq(flags.len(), 3)
+    assert_eq(s"${flags.at(0).0}=${flags.at(0).1}", "heap=true")
+    assert_eq(s"${flags.at(1).0}=${flags.at(1).1}", "os=false")
+    assert_eq(s"${flags.at(2).0}=${flags.at(2).1}", "fs=true")
+    assert_eq(read("a = true").get("a").unwrap().flags().len(), 0)
+
+@test("object_of builds an object in the order given, which reads and renders as a written one")
+objects_built_by_a_program()
+    val v = read("a = 1\nb = \"x\"")
+    var fields: Buf[(string, Value)] = buf()
+
+    fields.push(("second", v.get("b").unwrap()))
+    fields.push(("first", v.get("a").unwrap()))
+
+    val built = object_of(fields)
+
+    assert_eq(s"${built.keys().at(0)} ${built.keys().at(1)}", "second first")
+    assert_eq(built.scalar_at("first"), Some("1"))
+    assert_eq(render(built), "second = \"x\"\nfirst = 1\n")
+    assert(same(built, read("second = \"x\", first = 1")), "the same tree as the text")
+    assert_eq(object_of(buf()).fields().len(), 0)
+
+    // A name holding a dot is one name, as a quoted key is.
+    fields.push(("a.b", v.get("a").unwrap()))
+    assert_eq(object_of(fields).get("a.b").unwrap().as_long(), Some(1))
+    assert_eq(render(object_of(fields)), "second = \"x\"\nfirst = 1\n\"a.b\" = 1\n")
 
 // -- writing back ----------------------------------------------------------------------------------
 
@@ -437,6 +651,12 @@ readme_examples()
         Ok(_) -> panic("read")
         Err(d) ->
             assert_eq(d.render(bad), "error: expected ',' or a new line after the value of `pin`\n --> board.hocon:4:23\n  |\n4 |     pin = GP16 colour = red\n  |                       ^ found `=`\n")
+
+    val open = source_of("sysl.hocon", "package {\n  name = \"a\"\n")
+
+    parse(open) match
+        Ok(_) -> panic("read")
+        Err(d) -> assert_eq(d.render(open), "error: unclosed object — expected '}'\n --> sysl.hocon:3:1\n  |\n3 | \n  | ^ the input ends here\n  |\n  = note: the '{' at line 1, column 9 is never closed\n")
 
 // -- size ------------------------------------------------------------------------------------------
 

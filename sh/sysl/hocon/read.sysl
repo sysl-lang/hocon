@@ -76,14 +76,12 @@ private read_object(r: *Reader, prefix: Buf[string], open: Option[usize]) -> Res
         r.s.peek() match
             None ->
                 open match
-                    Some(at) ->
-                        return Err(error(one(at), "unclosed object — expected '}'")
-                            .with_label("this '{' is never closed"))
+                    Some(at) -> return Err(unclosed(r, "unclosed object — expected '}'", at))
                     None -> break
             Some(c) ->
                 if c == u8('}') then
                     if open.is_none() then
-                        return Err(error(one(r.s.offset), "a '}' closes an object that was never opened"))
+                        return Err(error(one(r.s.offset), "a '}' closes a block that was never opened"))
 
                     r.s.bump()
                     break
@@ -92,7 +90,7 @@ private read_object(r: *Reader, prefix: Buf[string], open: Option[usize]) -> Res
                     // reader always has: `a = 1,, b = 2` loses nothing a reader meant.
                     r.s.bump()
                 else
-                    val key = read_field(r, &fields, prefix)?
+                    val key = read_field(r, &fields, prefix, open)?
 
                     end_of_entry(r, s"the value of `${path_text(key)}`")?
 
@@ -102,6 +100,19 @@ private read_object(r: *Reader, prefix: Buf[string], open: Option[usize]) -> Res
 
     Ok(Value(Span(from, r.s.offset), Obj(fields)))
 end read_object
+
+// The refusal for an object, array or string the input ends inside. **It points where the input
+// ends**, which is where the missing close belongs and where the reader stopped, and the note says
+// where the thing was opened.
+private unclosed(r: *Reader, message: string, open: usize) -> Diagnostic
+    val loc = r.src.locate(open)
+    val what = r.s.src[open]
+    val opener = if what == u8('"') then "'\"'" elif what == u8('[') then "'['" else "'{'"
+
+    error(point(r.s.src.len), message)
+        .with_label("the input ends here")
+        .with_note(s"the $opener at line ${loc.line}, column ${loc.col} is never closed")
+end unclosed
 
 // What may follow a value: a comma, the end of the line, a comment, a closing bracket, or the end.
 private end_of_entry(r: *Reader, what: string) -> Result[unit, Diagnostic]
@@ -124,7 +135,9 @@ end end_of_entry
 
 // One field, filed into the object being read. Answers the path of its key, for the message about
 // what follows it.
-private read_field(r: *Reader, fields: *Buf[Field], prefix: Buf[string]) -> Result[Buf[string], Diagnostic]
+//
+// `open` is where the brace of the object being read was, or `None` for a root written without one.
+private read_field(r: *Reader, fields: *Buf[Field], prefix: Buf[string], open: Option[usize]) -> Result[Buf[string], Diagnostic]
     refuse_include(r)?
 
     val (path, spans) = read_path(r, "a key")?
@@ -134,12 +147,28 @@ private read_field(r: *Reader, fields: *Buf[Field], prefix: Buf[string]) -> Resu
     val value = r.s.peek() match
         Some(c) ->
             if c == u8('{') then
-                val open = r.s.offset
+                val brace = r.s.offset
 
                 r.s.bump()
-                read_object(r, joined(prefix, path), Some(open))?
+                read_object(r, joined(prefix, path), Some(brace))?
             elif c == u8('=') || c == u8(':') then
                 r.s.bump()
+
+                // A binding with nothing after it but the end of the input, inside braces, is an
+                // object that was never closed: that is the mistake to fix, and the value is what the
+                // writer was still typing.
+                val m = r.s.mark()
+
+                skip_space(r)
+
+                if r.s.at_end() then
+                    open match
+                        Some(at) -> return Err(unclosed(r, "unclosed object — expected '}'", at))
+                        None ->
+                            return Err(error(point(r.s.src.len), "a value was expected")
+                                .with_label(s"the value of `${path_text(path)}` is missing"))
+
+                r.s.reset(m)
 
                 // The value starts on the key's own line, so a key with nothing after its `=` is
                 // reported there rather than wherever the next line happens to begin.
@@ -151,11 +180,11 @@ private read_field(r: *Reader, fields: *Buf[Field], prefix: Buf[string]) -> Resu
             else
                 val span = one(r.s.offset)
 
-                return Err(error(span, s"expected '=', ':' or '{' after the key `${path_text(path)}`")
-                    .with_label(s"found ${found(r, span)}"))
+                return Err(error(span, s"'${key_words(path)}' is followed by ${quoted_char(r)} rather than '=' or a block")
+                    .with_label("expected '=', ':' or '{'"))
         None ->
-            return Err(error(r.s.here(), s"expected '=', ':' or '{' after the key `${path_text(path)}`")
-                .with_label("found the end of the input"))
+            return Err(error(r.s.here(), s"'${key_words(path)}' names nothing")
+                .with_label("expected '=', ':' or '{' after the key"))
 
     file_path(r, fields, prefix, path, spans, value)
     Ok(path)
@@ -199,6 +228,19 @@ private read_path(r: *Reader, what: string) -> Result[(Buf[string], Buf[Span]), 
 
             if r.s.offset == m then
                 val span = one(m)
+
+                // A key whose last dot the input ends after, as one being typed does, names nothing.
+                if what == "a key" && !names.is_empty() then
+                    r.s.skip_blanks()
+
+                    if r.s.at_end() then
+                        return Err(error(r.s.here(), s"'${key_words(names)}.' names nothing")
+                            .with_label("expected a key after the '.'"))
+
+                    r.s.reset(m)
+
+                if what == "a key" && !r.s.at_end() then
+                    return Err(error(span, s"${quoted_char(r)} cannot begin a key").with_label("expected a key"))
 
                 return Err(error(span, s"expected $what").with_label(s"found ${found(r, span)}"))
 
@@ -323,9 +365,7 @@ private read_array(r: *Reader) -> Result[Value, Diagnostic]
         skip_space(r)
 
         r.s.peek() match
-            None ->
-                return Err(error(one(open), "unclosed array — expected ']'")
-                    .with_label("this '[' is never closed"))
+            None -> return Err(unclosed(r, "a '[' was opened and never closed", open))
             Some(c) ->
                 if c == u8(']') then
                     r.s.bump()
@@ -334,6 +374,16 @@ private read_array(r: *Reader) -> Result[Value, Diagnostic]
                     r.s.bump()
                 else
                     items.push(read_value(r, buf())?)
+
+                    // A separator inside an element is the mistake of a key written where only a
+                    // value can stand: `[dep:lmdb]` wanted its quotes.
+                    skip_blanks(r)
+
+                    if r.s.peek() == Some(u8(':')) || r.s.peek() == Some(u8('=')) then
+                        return Err(error(one(r.s.offset), "unexpected token in value")
+                            .with_label(s"found ${found(r, one(r.s.offset))}")
+                            .with_note("an array holds values, not keys: quote an element that holds a ':' or an '='"))
+
                     end_of_entry(r, "an array element")?
 
     Ok(Value(Span(open, r.s.offset), Arr(items)))
@@ -362,7 +412,7 @@ private read_value(r: *Reader, path: Buf[string]) -> Result[Value, Diagnostic]
             if parts.is_empty() then
                 val span = one(r.s.offset)
 
-                return Err(error(span, "expected a value")
+                return Err(error(span, "a value was expected")
                     .with_label(s"found ${found(r, span)}")
                     .with_note("a value is a string, a number, `true`, `false`, `null`, an object, an array or a `${substitution}`"))
 
@@ -402,7 +452,7 @@ private read_value(r: *Reader, path: Buf[string]) -> Result[Value, Diagnostic]
     if parts.is_empty() then
         val span = r.s.here()
 
-        return Err(error(span, "expected a value").with_label(s"found ${found(r, one(r.s.offset))}"))
+        return Err(error(span, "a value was expected").with_label(s"found ${found(r, one(r.s.offset))}"))
 
     if parts.len() == 1 then return Ok(scalar(parts.at(0)))
 
@@ -458,11 +508,11 @@ private number_of(w: string) -> Kind
 
     if whole then
         parse_long(w) match
-            Ok(n) -> return Int(n)
+            Ok(n) -> return Int(n, w)
             Err(_) -> ()
 
     parse_real(w) match
-        Ok(x) -> Real(x)
+        Ok(x) -> Real(x, w)
         Err(_) -> Word(w)
 end number_of
 
@@ -473,7 +523,7 @@ private read_subst(r: *Reader) -> Result[Value, Diagnostic]
     if !r.s.accept_seq("${".bytes) then
         val span = one(m)
 
-        return Err(error(span, "expected a value").with_label(s"found ${found(r, span)}")
+        return Err(error(span, "a value was expected").with_label(s"found ${found(r, span)}")
             .with_note("a `$` begins a substitution, `${path}`; quote it to mean the character"))
 
     val optional = r.s.accept(u8('?'))
@@ -498,9 +548,7 @@ private read_string(r: *Reader) -> Result[string, Diagnostic]
 
     loop
         r.s.peek() match
-            None ->
-                return Err(error(Span(open, r.s.offset), "unterminated string")
-                    .with_label("this string is never closed"))
+            None -> return Err(unclosed(r, "a quoted string was opened and never closed", open))
             Some(c) ->
                 if c == u8('"') then
                     r.s.bump()
@@ -580,6 +628,33 @@ private skip_blanks(r: *Reader)
 private at_comment(r: *Reader) -> bool = r.s.starts_with("#".bytes) || r.s.starts_with("//".bytes)
 
 private one(at: usize) -> Span = Span(at, at + 1)
+
+// The character the reader stands on, in single quotes as a message names it -- the whole character,
+// however many bytes it takes -- or "a new line".
+private quoted_char(r: *Reader) -> string
+    val m = r.s.mark()
+
+    if r.s.peek() == Some(u8('\n')) || r.s.peek() == Some(u8('\r')) then return "a new line"
+
+    r.s.next_char()
+
+    val text = from_utf8_unchecked(r.s.text_from(m))
+
+    r.s.reset(m)
+    s"'$text'"
+end quoted_char
+
+// A key path as the writer spelled its names, joined by dots: the names a message quotes.
+private key_words(path: Buf[string]) -> string
+    var b = str_builder()
+
+    for i in 0..<path.len()
+        if i > 0 then b.push(".")
+
+        b.push(path.at(i))
+
+    b.finish()
+end key_words
 
 // What was found at a place, for a label: a new line is named rather than shown as `\n`.
 private found(r: *Reader, span: Span) -> string
