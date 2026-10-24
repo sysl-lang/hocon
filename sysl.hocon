@@ -8,7 +8,7 @@
 // This is the block a consumer writes to reach it:
 //
 //     dependencies {
-//       hocon { git = "github.com/sysl-lang/hocon", version = "0.2.0" }
+//       hocon { git = "github.com/sysl-lang/hocon", version = "0.2.1" }
 //     }
 //
 // The coordinate names the package, `hocon`; the module a program imports is `sh.sysl.hocon`. Naming
@@ -17,12 +17,12 @@
 
 package {
   name    = "hocon"
-  version = "0.2.0"
-  sysl    = "0.5.0"
+  version = "0.2.1"
+  sysl    = "0.5.7"
 }
 
 dependencies {
-  parsing { git = "github.com/sysl-lang/parsing", version = "0.13.0" }
+  parsing { git = "github.com/sysl-lang/parsing", version = "0.13.1" }
 }
 
 // A document's size is not known until it has been read, so the tree is built on the heap. Nothing
