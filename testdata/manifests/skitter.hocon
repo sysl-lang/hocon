@@ -1,0 +1,46 @@
+// Skitter — a sysl application on a phone, and the parts of that which are not the application's.
+//
+// **What is here is what an Android program cannot get from SDL and cannot write for itself.**
+// SDL3 covers nearly all of a phone already: a tap arrives as a mouse event, typed text arrives
+// composed, the renderer and the texture are the same calls a desktop makes. Three things are left
+// over, and each of them was found by an application getting it wrong:
+//
+//   - the system bars, which reach a program through JNI or not at all;
+//   - the drawable rectangle those bars leave, which is not the one SDL's `safe_area` answers;
+//   - the orientation pair, where naming the orientations does nothing unless the window is
+//     also resizable.
+//
+// **The bars are why this is a package rather than advice.** The symbol JNI looks up is mangled
+// from a class's package name, so every application that wrote its own bridge wrote a different
+// symbol, by hand, matching a Scala file it also had to keep in step. Skitter fixes the class at
+// `sh.sysl.skitter.SkitterActivity`, which fixes the symbol, which is what lets the bridge live in
+// a library at all. An application using `sysl-lang/skitter-app` writes none of it.
+//
+//     dependencies {
+//       skitter { git = "github.com/sysl-lang/skitter", version = "0.3.3" }
+//     }
+//
+// Naming this one reaches SDL3 through it, so an application names only this.
+package {
+  name    = "skitter"
+  version = "0.3.3"
+
+  // 0.0.161: an `#if` in a module keeps its declarations when the package is a dependency, a
+  // `build-c` archive no longer leaves `sysl_wall_us` undefined, and `sysl.log.message_text` is what
+  // the logcat sink renders with.
+  sysl = "0.0.161"
+}
+
+dependencies {
+  sdl3 { git = "github.com/sysl-lang/sdl3", version = "0.3.6" }
+
+  // The settings file is TOML, read by this; it is written by `prefs.sysl` itself.
+  toml { git = "github.com/sysl-lang/toml", version = "0.1.3" }
+}
+
+// What `sh.sysl.sdl3` itself requires, restated because a program reaching a gated module has to say
+// so too. Android answers both: Bionic is POSIX, and `Os.Android` is in the compiler's POSIX set.
+requires {
+  heap  = true
+  posix = true
+}

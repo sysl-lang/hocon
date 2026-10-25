@@ -2,26 +2,14 @@ module sh.sysl.hocon
 
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
-import sysl.text.{from_utf8_unchecked, parse_long, parse_real, str_builder}
+import sysl.text.{parse_long, parse_real, str_builder}
 
-// The reader: text to the tree as written, substitutions and all.
+// The value tree, derived from the lossless tree `syntax` reads.
 //
-// **It stops at the first mistake**, and says where it is with a span. A configuration file is short
-// and edited by hand, so the one message that matters is the first: a missing brace makes everything
-// after it mean something else, and a second message about that something else sends the reader to
-// the wrong line.
-//
-// What it reads is HOCON as Lightbend's specification writes it, less three things that are refused
-// with a message rather than misread: `include`, `+=`, and a value that refers to its own earlier
-// setting (`path = ${path}":/bin"`), which the resolver reports as a cycle. The document is one text,
-// so there is nothing for an include to reach; the other two need the history of a key, which a
-// tree of values does not keep.
-
-private struct Reader
-    src: Source
-    s: Scanner
-    repeats: Buf[Repeat]
-end Reader
+// Every refusal of a document is the reading's (`syntax.sysl`): this half gives meaning to what was
+// written and cannot fail. A dotted key becomes nested objects, a name written twice merges or is
+// replaced, a bare word becomes the number, boolean or `null` it spells, and text written side by
+// side becomes one string.
 
 /** A document read and resolved: every substitution replaced by what it names. */
 parse(src: Source) -> Result[Document, Diagnostic]
@@ -32,230 +20,89 @@ end parse
 
 /** A document read as written, with its substitutions, concatenations and merges left in place. */
 parse_unresolved(src: Source) -> Result[Document, Diagnostic]
-    var r = Reader(src, scan(src), buf())
+    val tree = syntax(src)?
+    var repeats: Buf[Repeat] = buf()
+    val root = value_of(&repeats, tree.root, buf())
 
-    // A byte-order mark is not part of the document.
-    r.s.accept_seq("\u{feff}".bytes)
-    skip_space(&r)
-
-    val root = r.s.peek() match
-        Some(c) ->
-            if c == u8('[') then
-                read_array(&r)?
-            elif c == u8('{') then
-                val open = r.s.offset
-
-                r.s.bump()
-                read_object(&r, buf(), Some(open))?
-            else
-                read_object(&r, buf(), None)?
-        None -> Value(point(0), Obj(buf()))
-
-    skip_space(&r)
-
-    if !r.s.at_end() then
-        val span = one(r.s.offset)
-
-        return Err(error(span, "unexpected text after the end of the document")
-            .with_label(s"found ${found(&r, span)}"))
-
-    Ok(Document(root, r.repeats))
+    Ok(Document(root, repeats))
 end parse_unresolved
 
-// -- objects ---------------------------------------------------------------------------------------
+/** The value tree of a document already read into its lossless tree. */
+values_of(tree: Syntax) -> Document
+    var repeats: Buf[Repeat] = buf()
+    val root = value_of(&repeats, tree.root, buf())
 
-// The fields of one object, up to its closing brace -- or, for a root written without braces, to the
-// end of the input. `open` is where the brace was, which is what an unclosed object points at.
-private read_object(r: *Reader, prefix: Buf[string], open: Option[usize]) -> Result[Value, Diagnostic]
-    val start = r.s.offset
-    var fields: Buf[Field] = buf()
+    Document(root, repeats)
+end values_of
 
-    loop
-        skip_space(r)
+// A written value as a value. `path` is where it is being filed, which an object inside it carries as
+// its prefix. A value of one part that is a bare word is turned into what it spells.
+private value_of(repeats: *Buf[Repeat], n: Node, path: Buf[string]) -> Value
+    n.kind match
+        NJoined(written) ->
+            var parts: Buf[Value] = buf()
 
-        r.s.peek() match
-            None ->
-                open match
-                    Some(at) -> return Err(unclosed(r, "unclosed object — expected '}'", at))
-                    None -> break
-            Some(c) ->
-                if c == u8('}') then
-                    if open.is_none() then
-                        return Err(error(one(r.s.offset), "a '}' closes a block that was never opened"))
+            for p in written
+                parts.push(part_of(repeats, p, path))
 
-                    r.s.bump()
-                    break
-                elif c == u8(',') then
-                    // A comma with nothing before it is passed over, as the sysl compiler's manifest
-                    // reader always has: `a = 1,, b = 2` loses nothing a reader meant.
-                    r.s.bump()
-                else
-                    val key = read_field(r, &fields, prefix, open)?
+            joined_value(n.span, parts)
+        _ -> scalar(part_of(repeats, n, path))
+end value_of
 
-                    end_of_entry(r, s"the value of `${path_text(key)}`")?
+private part_of(repeats: *Buf[Repeat], n: Node, path: Buf[string]) -> Value
+    n.kind match
+        NBlock(entries, _) ->
+            var fields: Buf[Field] = buf()
 
-    val from = open match
-        Some(at) -> at
-        None -> start
+            for e in entries
+                val names = e.names()
+                val v = value_of(repeats, e.value, joined(path, names))
 
-    Ok(Value(Span(from, r.s.offset), Obj(fields)))
-end read_object
+                file_path(repeats, &fields, path, e.path, v)
 
-// The refusal for an object, array or string the input ends inside. **It points where the input
-// ends**, which is where the missing close belongs and where the reader stopped, and the note says
-// where the thing was opened.
-private unclosed(r: *Reader, message: string, open: usize) -> Diagnostic
-    val loc = r.src.locate(open)
-    val what = r.s.src[open]
-    val opener = if what == u8('"') then "'\"'" elif what == u8('[') then "'['" else "'{'"
+            Value(n.span, Obj(fields))
+        NList(items) ->
+            var out: Buf[Value] = buf()
 
-    error(point(r.s.src.len), message)
-        .with_label("the input ends here")
-        .with_note(s"the $opener at line ${loc.line}, column ${loc.col} is never closed")
-end unclosed
+            for item in items
+                out.push(value_of(repeats, item, buf()))
 
-// What may follow a value: a comma, the end of the line, a comment, a closing bracket, or the end.
-private end_of_entry(r: *Reader, what: string) -> Result[unit, Diagnostic]
-    skip_blanks(r)
+            Value(n.span, Arr(out))
+        NQuoted(s) -> Value(n.span, Str(s))
+        NBare(s) -> Value(n.span, Word(s))
+        NRef(p, optional) -> Value(n.span, Subst(p, optional))
+        NJoined(_) -> value_of(repeats, n, path)
+end part_of
 
-    r.s.peek() match
-        None -> Ok(())
-        Some(c) ->
-            if c == u8(',') then
-                r.s.bump()
-                Ok(())
-            elif c == u8('\n') || c == u8('\r') || c == u8('}') || c == u8(']') || at_comment(r) then
-                Ok(())
-            else
-                val span = one(r.s.offset)
+// Text written side by side with nothing to resolve is one string now: `a = hello world` is the
+// word `hello world`, and `a = "x" y` the string `x y`. Anything else is a concatenation.
+private joined_value(span: Span, parts: Buf[Value]) -> Value
+    var plain = true
+    var quoted_part = false
 
-                Err(error(span, s"expected ',' or a new line after $what")
-                    .with_label(s"found ${found(r, span)}"))
-end end_of_entry
+    for p in parts
+        p.kind match
+            Word(_) -> ()
+            Str(_) -> quoted_part = true
+            _ -> plain = false
 
-// One field, filed into the object being read. Answers the path of its key, for the message about
-// what follows it.
-//
-// `open` is where the brace of the object being read was, or `None` for a root written without one.
-private read_field(r: *Reader, fields: *Buf[Field], prefix: Buf[string], open: Option[usize]) -> Result[Buf[string], Diagnostic]
-    refuse_include(r)?
+    if plain then
+        var b = str_builder()
 
-    val (path, spans) = read_path(r, "a key")?
+        for p in parts
+            b.push(p.as_text().unwrap())
 
-    skip_blanks(r)
+        val text = b.finish()
 
-    val value = r.s.peek() match
-        Some(c) ->
-            if c == u8('{') then
-                val brace = r.s.offset
+        return Value(span, if quoted_part then Str(text) else Word(text))
+    end if
 
-                r.s.bump()
-                read_object(r, joined(prefix, path), Some(brace))?
-            elif c == u8('=') || c == u8(':') then
-                r.s.bump()
-
-                // A binding with nothing after it but the end of the input, inside braces, is an
-                // object that was never closed: that is the mistake to fix, and the value is what the
-                // writer was still typing.
-                val m = r.s.mark()
-
-                skip_space(r)
-
-                if r.s.at_end() then
-                    open match
-                        Some(at) -> return Err(unclosed(r, "unclosed object — expected '}'", at))
-                        None ->
-                            return Err(error(point(r.s.src.len), "a value was expected")
-                                .with_label(s"the value of `${path_text(path)}` is missing"))
-
-                r.s.reset(m)
-
-                // The value starts on the key's own line, so a key with nothing after its `=` is
-                // reported there rather than wherever the next line happens to begin.
-                skip_blanks(r)
-                read_value(r, joined(prefix, path))?
-            elif c == u8('+') && r.s.peek_at(1) == Some(u8('=')) then
-                return Err(error(Span(r.s.offset, r.s.offset + 2), "`+=` is not supported")
-                    .with_note("write the whole value out: a setting that adds to its own earlier value is not supported"))
-            else
-                val span = one(r.s.offset)
-
-                return Err(error(span, s"'${key_words(path)}' is followed by ${quoted_char(r)} rather than '=' or a block")
-                    .with_label("expected '=', ':' or '{'"))
-        None ->
-            return Err(error(r.s.here(), s"'${key_words(path)}' names nothing")
-                .with_label("expected '=', ':' or '{' after the key"))
-
-    file_path(r, fields, prefix, path, spans, value)
-    Ok(path)
-end read_field
-
-// `include "file"` and its friends, which name another text this reader has no way to reach.
-private refuse_include(r: *Reader) -> Result[unit, Diagnostic]
-    if !r.s.starts_with("include".bytes) then return Ok(())
-
-    val m = r.s.mark()
-
-    r.s.skip(7)
-
-    val gap = r.s.skip_blanks()
-
-    val target =
-        r.s.starts_with("\"".bytes) || r.s.starts_with("file(".bytes) || r.s.starts_with("url(".bytes) ||
-        r.s.starts_with("classpath(".bytes) || r.s.starts_with("required(".bytes)
-
-    if gap > 0 && target then
-        return Err(error(Span(m, m + 7), "`include` is not supported")
-            .with_note("a document is read from one text: put the included settings in it, or read both documents and look in each"))
-
-    r.s.reset(m)
-    Ok(())
-end refuse_include
-
-// A key path, `a.b."c.d"`: its segments, and the span of each.
-private read_path(r: *Reader, what: string) -> Result[(Buf[string], Buf[Span]), Diagnostic]
-    var names: Buf[string] = buf()
-    var spans: Buf[Span] = buf()
-
-    loop
-        val m = r.s.mark()
-
-        if r.s.peek() == Some(u8('"')) then
-            names.push(read_string(r)?)
-        else
-            while !r.s.at_end() && r.s.peek() != Some(u8('.')) && unquoted_byte(r.s.src, r.s.offset)
-                r.s.bump()
-
-            if r.s.offset == m then
-                val span = one(m)
-
-                // A key whose last dot the input ends after, as one being typed does, names nothing.
-                if what == "a key" && !names.is_empty() then
-                    r.s.skip_blanks()
-
-                    if r.s.at_end() then
-                        return Err(error(r.s.here(), s"'${key_words(names)}.' names nothing")
-                            .with_label("expected a key after the '.'"))
-
-                    r.s.reset(m)
-
-                if what == "a key" && !r.s.at_end() then
-                    return Err(error(span, s"${quoted_char(r)} cannot begin a key").with_label("expected a key"))
-
-                return Err(error(span, s"expected $what").with_label(s"found ${found(r, span)}"))
-
-            names.push(from_utf8_unchecked(r.s.text_from(m)))
-
-        spans.push(r.s.span_from(m))
-
-        if !r.s.accept(u8('.')) then break
-
-    Ok((names, spans))
-end read_path
+    Value(span, Concat(parts))
+end joined_value
 
 // Files a value under a path into the fields being read, nesting a dotted path into the objects it
 // names.
-private file_path(r: *Reader, fields: *Buf[Field], prefix: Buf[string], path: Buf[string], spans: Buf[Span], value: Value)
+private file_path(repeats: *Buf[Repeat], fields: *Buf[Field], prefix: Buf[string], path: Buf[Key], value: Value)
     var v = value
     var i = path.len() - 1
 
@@ -264,17 +111,17 @@ private file_path(r: *Reader, fields: *Buf[Field], prefix: Buf[string], path: Bu
     while i > 0
         var inner: Buf[Field] = buf()
 
-        inner.push(Field(path.at(i), spans.at(i), v, i < path.len() - 1))
-        v = Value(spans.at(i).to(v.span), Obj(inner))
+        inner.push(Field(path.at(i).name, path.at(i).span, v, i < path.len() - 1))
+        v = Value(path.at(i).span.to(v.span), Obj(inner))
         i -= 1
 
-    put(r, fields, prefix, Field(path.at(0), spans.at(0), v, path.len() > 1))
+    put(repeats, fields, prefix, Field(path.at(0).name, path.at(0).span, v, path.len() > 1))
 end file_path
 
 // One field into an object's fields. **A name already there is HOCON's merge**: two objects become
 // one, a later plain value replaces whatever was there, and anything not known until resolution --
 // a substitution, a concatenation -- is kept as a merge of layers for the resolver to decide.
-private put(r: *Reader, fields: *Buf[Field], prefix: Buf[string], f: Field)
+private put(repeats: *Buf[Repeat], fields: *Buf[Field], prefix: Buf[string], f: Field)
     for i in 0..<fields.len()
         val old = fields.at(i)
 
@@ -282,7 +129,7 @@ private put(r: *Reader, fields: *Buf[Field], prefix: Buf[string], f: Field)
             val here = joined1(prefix, f.key)
 
             if !old.implied && !f.implied then
-                r.repeats.push(Repeat(path_text(here), old.key_span, f.key_span))
+                repeats.push(Repeat(path_text(here), old.key_span, f.key_span))
 
             val merged = old.value.kind match
                 Obj(was) ->
@@ -294,7 +141,7 @@ private put(r: *Reader, fields: *Buf[Field], prefix: Buf[string], f: Field)
                                 acc.push(g)
 
                             for g in now
-                                put(r, &acc, here, g)
+                                put(repeats, &acc, here, g)
 
                             Value(old.value.span, Obj(acc))
                         _ -> layered(old.value, f.value)
@@ -353,136 +200,6 @@ private joined1(prefix: Buf[string], key: string) -> Buf[string]
     out
 end joined1
 
-// -- arrays ----------------------------------------------------------------------------------------
-
-private read_array(r: *Reader) -> Result[Value, Diagnostic]
-    val open = r.s.offset
-    var items: Buf[Value] = buf()
-
-    r.s.bump()
-
-    loop
-        skip_space(r)
-
-        r.s.peek() match
-            None -> return Err(unclosed(r, "a '[' was opened and never closed", open))
-            Some(c) ->
-                if c == u8(']') then
-                    r.s.bump()
-                    break
-                elif c == u8(',') then
-                    r.s.bump()
-                else
-                    items.push(read_value(r, buf())?)
-
-                    // A separator inside an element is the mistake of a key written where only a
-                    // value can stand: `[dep:lmdb]` wanted its quotes.
-                    skip_blanks(r)
-
-                    if r.s.peek() == Some(u8(':')) || r.s.peek() == Some(u8('=')) then
-                        return Err(error(one(r.s.offset), "unexpected token in value")
-                            .with_label(s"found ${found(r, one(r.s.offset))}")
-                            .with_note("an array holds values, not keys: quote an element that holds a ':' or an '='"))
-
-                    end_of_entry(r, "an array element")?
-
-    Ok(Value(Span(open, r.s.offset), Arr(items)))
-end read_array
-
-// -- values ----------------------------------------------------------------------------------------
-
-// One value: the parts written side by side up to the end of the line, a comma or a closing bracket.
-// `path` is where it is being filed, which an object inside it carries as its prefix.
-private read_value(r: *Reader, path: Buf[string]) -> Result[Value, Diagnostic]
-    var parts: Buf[Value] = buf()
-
-    loop
-        val gap_from = r.s.offset
-        val gap = r.s.skip_blanks()
-
-        if r.s.at_end() || at_comment(r) then break
-
-        val c = r.s.peek().unwrap()
-
-        if c == u8('\n') || c == u8('\r') || c == u8(',') || c == u8('}') || c == u8(']') then break
-
-        // A byte no value may begin with ends the value; the caller says what is wrong with it,
-        // unless nothing at all was read.
-        if c != u8('{') && c != u8('[') && c != u8('"') && c != u8('$') && !unquoted_byte(r.s.src, r.s.offset) then
-            if parts.is_empty() then
-                val span = one(r.s.offset)
-
-                return Err(error(span, "a value was expected")
-                    .with_label(s"found ${found(r, span)}")
-                    .with_note("a value is a string, a number, `true`, `false`, `null`, an object, an array or a `${substitution}`"))
-
-            r.s.reset(gap_from)
-            break
-        end if
-
-        if gap > 0 && !parts.is_empty() then
-            parts.push(Value(Span(gap_from, r.s.offset), Word(from_utf8_unchecked(r.s.src[gap_from..<r.s.offset]))))
-
-        val part =
-            if c == u8('{') then
-                val open = r.s.offset
-
-                r.s.bump()
-                read_object(r, path, Some(open))?
-            elif c == u8('[') then
-                read_array(r)?
-            elif c == u8('"') then
-                val m = r.s.mark()
-                val text = if r.s.starts_with("\"\"\"".bytes) then read_multiline(r)? else read_string(r)?
-
-                Value(r.s.span_from(m), Str(text))
-            elif c == u8('$') then
-                read_subst(r)?
-            else
-                val m = r.s.mark()
-
-                while !r.s.at_end() && unquoted_byte(r.s.src, r.s.offset)
-                    r.s.bump()
-
-                Value(r.s.span_from(m), Word(from_utf8_unchecked(r.s.text_from(m))))
-
-        parts.push(part)
-    end loop
-
-    if parts.is_empty() then
-        val span = r.s.here()
-
-        return Err(error(span, "a value was expected").with_label(s"found ${found(r, one(r.s.offset))}"))
-
-    if parts.len() == 1 then return Ok(scalar(parts.at(0)))
-
-    val span = parts.at(0).span.to(parts.at(parts.len() - 1).span)
-
-    // Text written side by side with nothing to resolve is one string now: `a = hello world` is the
-    // word `hello world`, and `a = "x" y` the string `x y`.
-    var plain = true
-    var quoted_part = false
-
-    for p in parts
-        p.kind match
-            Word(_) -> ()
-            Str(_) -> quoted_part = true
-            _ -> plain = false
-
-    if plain then
-        var b = str_builder()
-
-        for p in parts
-            b.push(p.as_text().unwrap())
-
-        val text = b.finish()
-
-        return Ok(Value(span, if quoted_part then Str(text) else Word(text)))
-    end if
-
-    Ok(Value(span, Concat(parts)))
-end read_value
-
 // A bare word standing alone, turned into what it spells: a number, `true`, `false`, `null`.
 private scalar(v: Value) -> Value
     v.kind match
@@ -515,151 +232,3 @@ private number_of(w: string) -> Kind
         Ok(x) -> Real(x, w)
         Err(_) -> Word(w)
 end number_of
-
-// `${a.b}` and `${?a.b}`.
-private read_subst(r: *Reader) -> Result[Value, Diagnostic]
-    val m = r.s.mark()
-
-    if !r.s.accept_seq("${".bytes) then
-        val span = one(m)
-
-        return Err(error(span, "a value was expected").with_label(s"found ${found(r, span)}")
-            .with_note("a `$` begins a substitution, `${path}`; quote it to mean the character"))
-
-    val optional = r.s.accept(u8('?'))
-    val (path, _) = read_path(r, "a path in the substitution")?
-
-    if !r.s.accept(u8('}')) then
-        val span = one(r.s.offset)
-
-        return Err(error(span, "expected '}' to close the substitution").with_label(s"found ${found(r, span)}"))
-
-    Ok(Value(r.s.span_from(m), Subst(path, optional)))
-end read_subst
-
-// -- strings ---------------------------------------------------------------------------------------
-
-// A quoted string, with JSON's escapes, ending on its own line.
-private read_string(r: *Reader) -> Result[string, Diagnostic]
-    val open = r.s.offset
-    var b = str_builder()
-
-    r.s.bump()
-
-    loop
-        r.s.peek() match
-            None -> return Err(unclosed(r, "a quoted string was opened and never closed", open))
-            Some(c) ->
-                if c == u8('"') then
-                    r.s.bump()
-                    break
-                elif c == u8('\n') then
-                    return Err(error(Span(open, r.s.offset), "unterminated string")
-                        .with_label("a quoted string ends on its own line")
-                        .with_note("use a triple-quoted string, \"\"\"like this\"\"\", for text over several lines"))
-                elif c == u8('\\') then
-                    val at = r.s.offset
-                    val e = r.s.peek_at(1)
-                    val json =
-                        e == Some(u8('"')) || e == Some(u8('\\')) || e == Some(u8('/')) || e == Some(u8('b')) ||
-                        e == Some(u8('f')) || e == Some(u8('n')) || e == Some(u8('r')) || e == Some(u8('t')) ||
-                        (e == Some(u8('u')) && r.s.peek_at(2) != Some(u8('{')))
-
-                    if !json then
-                        return Err(error(Span(at, if at + 2 <= r.s.src.len then at + 2 else at + 1), "not one of HOCON's escapes")
-                            .with_note("the escapes are JSON's: \\\" \\\\ \\/ \\b \\f \\n \\r \\t and \\uXXXX"))
-
-                    read_escape(&r.s) match
-                        Ok(ch) -> b.push_char(ch)
-                        Err(e) -> return Err(error(where(e), s"$e escape"))
-                else
-                    r.s.next_char() match
-                        Some(ch) -> b.push_char(ch)
-                        None -> return Err(error(one(r.s.offset), "not UTF-8 text"))
-
-    Ok(b.finish())
-end read_string
-
-// A triple-quoted string: everything up to the next `"""`, newlines included and nothing escaped. As
-// the specification says, quotes run on past three belong to the string: `""""a""""` is `"a"`.
-private read_multiline(r: *Reader) -> Result[string, Diagnostic]
-    val open = r.s.offset
-
-    r.s.skip(3)
-
-    val start = r.s.offset
-
-    loop
-        if r.s.at_end() then
-            return Err(error(Span(open, open + 3), "unterminated multi-line string")
-                .with_label("this '\"\"\"' is never closed"))
-
-        if r.s.starts_with("\"\"\"".bytes) then
-            var end = r.s.offset
-
-            while end + 3 < r.s.src.len && r.s.src[end + 3] == u8('"')
-                end += 1
-
-            val text = from_utf8_unchecked(r.s.src[start..<end])
-
-            r.s.reset(end + 3)
-            return Ok(text)
-        end if
-
-        r.s.bump()
-end read_multiline
-
-// -- blanks and comments ---------------------------------------------------------------------------
-
-// Spaces, tabs, new lines and comments: what may stand between two fields.
-private skip_space(r: *Reader)
-    loop
-        r.s.skip_space()
-
-        if r.s.skip_line_comment("#".bytes) || r.s.skip_line_comment("//".bytes) then continue
-
-        break
-end skip_space
-
-// Spaces and tabs only: what may stand inside a value, on its line.
-private skip_blanks(r: *Reader)
-    r.s.skip_blanks()
-
-private at_comment(r: *Reader) -> bool = r.s.starts_with("#".bytes) || r.s.starts_with("//".bytes)
-
-private one(at: usize) -> Span = Span(at, at + 1)
-
-// The character the reader stands on, in single quotes as a message names it -- the whole character,
-// however many bytes it takes -- or "a new line".
-private quoted_char(r: *Reader) -> string
-    val m = r.s.mark()
-
-    if r.s.peek() == Some(u8('\n')) || r.s.peek() == Some(u8('\r')) then return "a new line"
-
-    r.s.next_char()
-
-    val text = from_utf8_unchecked(r.s.text_from(m))
-
-    r.s.reset(m)
-    s"'$text'"
-end quoted_char
-
-// A key path as the writer spelled its names, joined by dots: the names a message quotes.
-private key_words(path: Buf[string]) -> string
-    var b = str_builder()
-
-    for i in 0..<path.len()
-        if i > 0 then b.push(".")
-
-        b.push(path.at(i))
-
-    b.finish()
-end key_words
-
-// What was found at a place, for a label: a new line is named rather than shown as `\n`.
-private found(r: *Reader, span: Span) -> string
-    if span.start < r.s.src.len && r.s.src[span.start] == u8('\n') then return "a new line"
-    if span.start < r.s.src.len && r.s.src[span.start] == u8('\r') then return "a new line"
-
-    found_at(r.src, span)
-end found

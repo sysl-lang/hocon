@@ -20,7 +20,7 @@ error: expected ',' or a new line after the value of `pin`
 
 ```hocon
 dependencies {
-  hocon { git = "github.com/sysl-lang/hocon", version = "0.2.2" }
+  hocon { git = "github.com/sysl-lang/hocon", version = "0.3.0" }
 }
 ```
 
@@ -66,6 +66,45 @@ main()
 - `render(v)` writes a value back as HOCON that reads to the same tree, and `same(a, b)` compares two
   trees ignoring spans.
 
+## The lossless tree, and editing a file
+
+`syntax(src)` reads a document into a tree that keeps every byte: `Syntax { src, root, pieces }`,
+where `root` is a `Node` (`NBlock(entries, braced)`, `NList`, `NQuoted`, `NBare`, `NRef`, `NJoined`),
+an `Entry { path: Buf[Key], span, value }` is one entry as written (`a.b = 1` is one entry with two
+`Key`s), and `pieces` tile the text — blanks, new lines, comments, punctuation, keys, words, strings,
+substitutions. `printed()` gives back the same bytes. **`parse` builds its values from this tree**
+(`values_of(tree)`), so there is one reading of a file.
+
+The edits rewrite the fewest bytes that have to change, and answer an `Edit { start, end, insert,
+text }`: the bytes `start..<end` replaced by `insert`, and the whole new document. Each takes a key
+path as a document writes one (`a.b."c.d"`) and a value as HOCON text.
+
+- `replace_value(src, path, value)` rewrites only the value's bytes.
+- `add_entry(src, path, value)` adds one line to the deepest block of the path that exists, after the
+  sibling sharing most of its key, with the siblings' indent, separator and `=` column where they are
+  lined up. A missing block is written nested, or as a dotted key where the file writes those. An
+  inline block gains `, c = 3` in place, and is reflowed to a block, alone, past 100 columns.
+- `remove_entry(src, path)` takes the entry's line, the comment lines directly above it with no blank
+  line between, and a comment after it on its line; one sharing a line loses only itself and a comma.
+- `set_value(src, path, value)` replaces where the path is set and adds where it is not.
+
+An edit is refused, with the lines, where it would have to guess: a path written in two places
+(`a.b = 1` and `a { b = 2 }`), a path that is only part of a longer dotted key, an entry under a
+value that is not an object. Every result is read back before it is answered. Nothing is reordered
+or reformatted.
+
+```sysl
+import sh.sysl.hocon.*
+import sh.sysl.parsing.source_of
+
+main()
+    val text = "package {\n  name    = \"app\"  // the name\n  version = \"0.1.0\"\n}\n"
+
+    add_entry(source_of("sysl.hocon", text), "package.sysl", "\"0.6.0\"") match
+        Ok(e) -> print(e.text)      // the new line is `  sysl    = "0.6.0"`, and the comment stays
+        Err(d) -> print(d.message)
+```
+
 ## What is read
 
 Objects with or without `=`/`:` before the brace, a root with or without braces (or an array),
@@ -104,6 +143,7 @@ compiler's manifest reader has always given, since that is this package's first 
   reported as a substitution cycle. Both need the history of a key, which a tree does not keep.
 - **Environment variables** are not consulted for a substitution that names nothing: that is an error
   unless it was written `${?path}`.
+- **`/* … */`** — HOCON's comments are `#` and `//` to the end of the line; it has no block comment.
 - `+` is allowed in an unquoted string except as the start of `+=`, so `1.0.0+build` needs no quotes.
 
 ## Licence

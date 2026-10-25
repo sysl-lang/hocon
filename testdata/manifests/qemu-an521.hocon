@@ -1,0 +1,48 @@
+// skiff on QEMU's MPS2 AN521: one image that both Cortex-M33 cores run. Core 0 starts first, clears
+// `.bss` and `.shared` and releases core 1; each core greets on its own UART and ticks on its own SysTick.
+// The image is built for no floating-point registers, since core 0 of the SSE-200 has none.
+
+package {
+  name    = "qemu-an521"
+  version = "0.0.1"
+}
+
+dependencies {
+  kernel { workspace = true, options = { cores = 2, tasks = 32 } }
+  armv7m { workspace = true }
+  armv8m { workspace = true }
+  an521 { workspace = true }
+  scenarios { workspace = true }
+}
+
+targets {
+  thumb-freestanding-soft {
+    linker_script = "link.ld"
+    entry         = "_start"
+  }
+}
+
+// Two images, the option (system.sysl): `--features core0` builds core 0's image, for no floating-point
+// registers as before, and `--features core1` core 1's, which may use its FPU (`thumb-freestanding`).
+// Each turns on `split` and lays its image out by a script of its own, with `.shared` at one address
+// in both. No feature at all is the one image both cores run.
+features {
+  split { doc = "the board as two images, one for each core" }
+  core0 {
+    doc     = "core 0's image of two"
+    enables = [split]
+    targets.thumb-freestanding-soft.linker_script = "core0.ld"
+  }
+  core1 {
+    doc     = "core 1's image of two"
+    enables = [split]
+    targets.thumb-freestanding {
+      linker_script = "core1.ld"
+      entry         = "_start"
+    }
+  }
+  skewed {
+    doc     = "an image whose .shared has one more field: the boot test's proof that images that disagree stop at the handshake"
+    enables = [split]
+  }
+}

@@ -1,0 +1,720 @@
+module sh.sysl.hocon
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{from_utf8_unchecked, str_builder, StrBuilder}
+
+// Editing a document by rewriting the fewest bytes that have to change.
+//
+// A configuration file is data, so the obvious edit -- read it, change the value, print it back -- is
+// available and is wrong: printing a value back emits the value and nothing else, and the files this
+// is for are mostly comment. **Every edit here is one splice**: a run of bytes of the original
+// replaced by new text, everything outside the run left exactly as it was. The places come from the
+// lossless tree `syntax` reads, which is the same reading `parse` builds its values from, so an edit
+// and a build cannot disagree about where a key is.
+//
+// **The file's own style is followed rather than imposed.** A new entry takes its siblings' indent,
+// lines its `=` up with theirs where they are lined up, uses their separator, and goes after the
+// sibling it shares the most of its key with. A missing block is written nested, or as a dotted key
+// where the file writes those. Nothing already in the file moves, with one exception: an inline block
+// that a new entry would push past 100 columns is reflowed into a block, and only that one.
+//
+// **What it cannot decide it refuses**, with the reason and the lines: a path written in two places
+// (`a.b = 1` and `a { b = 2 }`), a path that is only part of a longer dotted key, an entry added under
+// a value that is not an object. A refusal leaves the text untouched.
+
+/** One edit of a document: the bytes `start..<end` of the original replaced by `insert`, and the
+ * whole document that results.
+ */
+struct Edit
+    start: usize
+    end: usize
+    insert: string
+    text: string
+
+/** The longest line, in characters, that an inline block may grow to before it is reflowed. */
+val inline_limit: usize = 100
+
+/** The document with the value at `path` replaced by `value`, which is HOCON text (`"0.3.0"`,
+ * `{ git = "…" }`, `[1, 2]`). Only the value's own bytes are rewritten.
+ */
+replace_value(src: Source, path: string, value: string) -> Result[Edit, Diagnostic]
+    val tree = syntax(src)?
+    val target = path_of(path)?
+
+    one_value(value)?
+
+    val seen = entries_of(tree)?
+    val p = the_place(src, seen, target, "replace")?
+    val e = p.entry
+    val names = joined_names(p.prefix, e.names())
+
+    if names.len() > target.len() then
+        return Err(error(e.path.at(0).span,
+            s"`${path_text(target)}` is written only as part of the key `${path_text(names)}` on line ${line_of(src, e.span.start)}, so it has no value of its own to replace"))
+
+    // A block written without `=` (`a { … }`) gains one when what replaces it is not a block.
+    val b = src.bytes
+    val key_end = e.path.at(e.path.len() - 1).span.end
+    val sepless = first_after_blanks(b, key_end) == e.value.span.start
+
+    if sepless && !value.bytes.is_empty() && value.bytes[0] != u8('{') then
+        return checked(src, target, key_end, e.value.span.end, s" = $value", true)
+
+    checked(src, target, e.value.span.start, e.value.span.end, value, true)
+end replace_value
+
+/** The document with the entry at `path` taken out: its line, the comment lines directly above it
+ * with no blank line between, and a comment after it on the same line. An entry that shares its line
+ * with others (`{ a = 1, b = 2 }`) loses only itself and one comma.
+ */
+remove_entry(src: Source, path: string) -> Result[Edit, Diagnostic]
+    val tree = syntax(src)?
+    val target = path_of(path)?
+    val seen = entries_of(tree)?
+    val p = the_place(src, seen, target, "remove")?
+    val (start, end, insert) = removal(tree, p)
+
+    checked(src, target, start, end, insert, false)
+end remove_entry
+
+/** The document with an entry `path = value` added: into the deepest block of the path that already
+ * exists, after the sibling sharing the most of its key, in the siblings' indent and alignment.
+ */
+add_entry(src: Source, path: string, value: string) -> Result[Edit, Diagnostic]
+    val tree = syntax(src)?
+    val target = path_of(path)?
+
+    one_value(value)?
+
+    val seen = entries_of(tree)?
+    val here = places(seen, target)
+
+    if !here.is_empty() then
+        return Err(error(here.at(0).entry.path.at(0).span,
+            s"`${path_text(target)}` is already set, on line ${line_of(src, here.at(0).entry.span.start)}: replace it rather than add it"))
+
+    val (block, rest) = home_of(src, tree, seen, target)?
+    val (start, end, insert) = addition(tree, seen, block, rest, value)
+
+    checked(src, target, start, end, insert, true)
+end add_entry
+
+/** `replace_value` where the path is set and `add_entry` where it is not. */
+set_value(src: Source, path: string, value: string) -> Result[Edit, Diagnostic]
+    val tree = syntax(src)?
+    val target = path_of(path)?
+    val seen = entries_of(tree)?
+
+    if places(seen, target).is_empty() then add_entry(src, path, value) else replace_value(src, path, value)
+end set_value
+
+// -- where a path is written ---------------------------------------------------------------------
+
+// An entry, the block it was written in, and the path of that block.
+private struct Place
+    entry: Entry
+    block: Node
+    prefix: Buf[string]
+
+// Every entry of every block of the document, in the order written, each with where it sits.
+private entries_of(tree: Syntax) -> Result[Buf[Place], Diagnostic]
+    tree.root.kind match
+        NBlock(_, _) -> ()
+        _ -> return Err(error(tree.root.span, "the document is an array, and only the entries of an object can be edited"))
+
+    var out: Buf[Place] = buf()
+
+    walk(&out, tree.root, buf())
+    Ok(out)
+end entries_of
+
+private walk(out: *Buf[Place], block: Node, prefix: Buf[string])
+    block.kind match
+        NBlock(entries, _) ->
+            for e in entries
+                out.push(Place(e, block, prefix))
+
+                e.value.kind match
+                    NBlock(_, _) -> walk(out, e.value, joined_names(prefix, e.names()))
+                    _ -> ()
+        _ -> ()
+end walk
+
+// The entries a path is written at: each whose own key reaches the end of the path. `a { b = 1 }` writes
+// `a` at the entry `a` and `a.b` at `b`; `a.b = 1` writes both at the one entry.
+private places(seen: Buf[Place], target: Buf[string]) -> Buf[Place]
+    var out: Buf[Place] = buf()
+
+    for p in seen
+        val full = joined_names(p.prefix, p.entry.names())
+
+        if p.prefix.len() < target.len() && target.len() <= full.len() && starts_with(full, target) then out.push(p)
+
+    out
+end places
+
+// The one place a path is written, for an edit of what is there.
+private the_place(src: Source, seen: Buf[Place], target: Buf[string], verb: string) -> Result[Place, Diagnostic]
+    val here = places(seen, target)
+
+    if here.is_empty() then
+        return Err(error(point(0), s"there is no `${path_text(target)}` to $verb"))
+
+    if here.len() > 1 then return Err(two_places(src, target, here.at(0), here.at(1)))
+
+    Ok(here.at(0))
+end the_place
+
+private two_places(src: Source, target: Buf[string], a: Place, b: Place) -> Diagnostic =
+    error(b.entry.path.at(0).span,
+        s"`${path_text(target)}` is written in two places, lines ${line_of(src, a.entry.span.start)} and ${line_of(src, b.entry.span.start)}, and an edit would have to guess which one is meant")
+        .with_label("written again here")
+        .with_note("write it in one place by hand, then make the edit")
+
+// The deepest block of a path that already exists, and the segments of the path below it.
+private home_of(src: Source, tree: Syntax, seen: Buf[Place], target: Buf[string]) -> Result[(Node, Buf[string]), Diagnostic]
+    var k = target.len() - 1
+
+    while k > 0
+        val prefix = first_names(target, k)
+        val here = places(seen, prefix)
+        var blocks = 0
+
+        for p in here
+            if joined_names(p.prefix, p.entry.names()).len() == k then
+                p.entry.value.kind match
+                    NBlock(_, _) -> blocks += 1
+                    _ ->
+                        return Err(error(p.entry.value.span,
+                            s"`${path_text(prefix)}` is set on line ${line_of(src, p.entry.span.start)} to a value that is not an object, so `${path_text(target)}` cannot be added under it"))
+
+        if blocks > 0 && here.len() > 1 then return Err(two_places(src, prefix, here.at(0), here.at(1)))
+
+        if blocks == 1 then return Ok((here.at(0).entry.value, rest_names(target, k)))
+
+        k -= 1
+    end while
+
+    Ok((tree.root, target))
+end home_of
+
+// -- removing ------------------------------------------------------------------------------------
+
+private removal(tree: Syntax, p: Place) -> (usize, usize, string)
+    val b = tree.src.bytes
+    val e = p.entry
+    val ls = line_start(b, e.span.start)
+    val le = line_end(b, e.span.end)
+
+    if all_blank(b, ls, e.span.start) && only_trailing(tree, e.span.end, le) then
+        var start = ls
+
+        // The comment lines directly above, with no blank line between, are about this entry.
+        while start > 0
+            val above_end = before_newline(b, start)
+            val above = line_start(b, above_end)
+
+            if !comment_line(tree, above, above_end) then break
+
+            start = above
+
+        val end = if le < b.len then past_newline(b, le) else le
+
+        // The last line of a file written with no new line at its end stays without one.
+        if le == b.len && start > 0 then start = before_newline(b, start)
+
+        return (start, end, "")
+    end if
+
+    val siblings = entries_in(p.block)
+    var i: usize = 0
+
+    while i < siblings.len() && siblings.at(i).span.start != e.span.start
+        i += 1
+
+    if i + 1 < siblings.len() && !has_newline(b, e.span.end, siblings.at(i + 1).span.start) then
+        return (e.span.start, siblings.at(i + 1).span.start, "")
+
+    if i > 0 && !has_newline(b, siblings.at(i - 1).span.end, e.span.start) then
+        return (siblings.at(i - 1).span.end, e.span.end, "")
+
+    // The only entry of a block that opens and closes on its line: `{ a = 1 }` becomes `{}`.
+    if braced(p.block) && !has_newline(b, p.block.span.start, p.block.span.end) then
+        return (p.block.span.start + 1, p.block.span.end - 1, "")
+
+    (e.span.start, e.span.end, "")
+end removal
+
+// Whether nothing but blanks, a comma and a comment follows an entry to the end of its line.
+private only_trailing(tree: Syntax, from: usize, to: usize) -> bool
+    for piece in tree.pieces
+        if piece.span.end > from && piece.span.start < to then
+            piece.kind match
+                PBlank -> ()
+                PComment -> ()
+                PPunct -> if tree.src.bytes[piece.span.start] != u8(',') then return false
+                _ -> return false
+
+    true
+end only_trailing
+
+// Whether a line is a comment and nothing else but blanks.
+private comment_line(tree: Syntax, from: usize, to: usize) -> bool
+    var comment = false
+
+    for piece in tree.pieces
+        if piece.span.end > from && piece.span.start < to then
+            piece.kind match
+                PBlank -> ()
+                PComment -> comment = true
+                _ -> return false
+
+    comment
+end comment_line
+
+// -- adding --------------------------------------------------------------------------------------
+
+private addition(tree: Syntax, seen: Buf[Place], block: Node, rest: Buf[string], value: string) -> (usize, usize, string)
+    val b = tree.src.bytes
+    val siblings = entries_in(block)
+    val nl = newline_of(b)
+    val unit = indent_unit(b, seen)
+    val dotted = rest.len() > 1 && writes_dotted(seen, siblings, rest)
+
+    // The separator the siblings use: `:` where they write it, and none before a block where they
+    // write blocks without one.
+    var sep = "="
+    var block_sep = ""
+
+    for s in siblings
+        val c = byte_after_key(b, s)
+        val written = if c == u8(':') then ":" elif c == u8('=') then "=" else ""
+
+        s.value.kind match
+            NBlock(_, _) -> block_sep = written
+            _ -> if written == ":" then sep = ":"
+
+    val is_block = value.bytes.len > 0 && value.bytes[0] == u8('{')
+
+    if braced(block) && !has_newline(b, block.span.start, block.span.end) then
+        return inline_addition(tree, seen, block, rest, value, sep, block_sep, is_block, nl, unit)
+
+    // The sibling to follow: the last that shares the most of the key, or the last of all.
+    var anchor: Option[Entry] = None
+    var best: usize = 0
+
+    for s in siblings
+        val shared = common(s.names(), rest)
+
+        if shared >= best then
+            best = shared
+            anchor = Some(s)
+
+    val indent = anchor match
+        Some(a) -> leading_blanks(b, line_start(b, a.span.start))
+        None -> if braced(block) then s"${leading_blanks(b, line_start(b, block.span.start))}$unit" else ""
+
+    val column = aligned_column(b, siblings)
+
+    val line = entry_text(rest, value, dotted, sep, block_sep, is_block, column, indent, unit, nl)
+
+    anchor match
+        Some(a) ->
+            val le = line_end(b, a.span.end)
+
+            // A block closing on the anchor's own line keeps the new entry inside it.
+            if braced(block) && block.span.end - 1 >= a.span.end && block.span.end - 1 < le then
+                return (a.span.end, a.span.end, s"$nl$indent$line")
+
+            if le == b.len then return (le, le, s"$nl$indent$line")
+
+            val at = past_newline(b, le)
+
+            (at, at, s"$indent$line$nl")
+        None ->
+            if braced(block) then
+                val at = line_start(b, block.span.end - 1)
+
+                (at, at, s"$indent$line$nl")
+            elif b.len == 0 then
+                (0, 0, s"$line$nl")
+            elif b[b.len - 1] == u8('\n') || b[b.len - 1] == u8('\r') then
+                (b.len, b.len, s"$line$nl")
+            else
+                (b.len, b.len, s"$nl$line")
+end addition
+
+// `, c = 3` into a block that opens and closes on one line -- or, where the line would pass
+// `inline_limit`, that block written out one entry to a line.
+private inline_addition(tree: Syntax, seen: Buf[Place], block: Node, rest: Buf[string], value: string, sep: string,
+                        block_sep: string, is_block: bool, nl: string, unit: string) -> (usize, usize, string)
+    val b = tree.src.bytes
+    val siblings = entries_in(block)
+    val one_line = inline_text(rest, value, sep, block_sep, is_block)
+    val close = block.span.end - 1
+
+    val (start, end, insert) =
+        if siblings.is_empty() then
+            (block.span.start + 1, close, s" $one_line ")
+        else
+            val last = siblings.at(siblings.len() - 1).span.end
+
+            (last, last, s", $one_line")
+
+    val ls = line_start(b, start)
+    val le = line_end(b, end)
+    val width = chars(b, ls, start) + chars(insert.bytes, 0, insert.bytes.len) + chars(b, end, le)
+
+    if width <= inline_limit then return (start, end, insert)
+
+    val indent = leading_blanks(b, line_start(b, block.span.start))
+    var out = str_builder()
+
+    out.push(s"{$nl")
+
+    for s in siblings
+        out.push(s"$indent$unit${tree.text_of(s.span)}$nl")
+
+    out.push(s"$indent$unit${entry_text(rest, value, false, sep, block_sep, is_block, None, s"$indent$unit", unit, nl)}$nl")
+    out.push(s"$indent}")
+
+    (block.span.start, block.span.end, out.finish())
+end inline_addition
+
+// The text of a new entry on one line, for an inline block: nested blocks written inline too.
+private inline_text(rest: Buf[string], value: string, sep: string, block_sep: string, is_block: bool) -> string
+    var b = str_builder()
+    val last = rest.len() - 1
+
+    for i in 0..<last
+        b.push(s"${key_of(one_name(rest.at(i)))} { ")
+
+    b.push(key_of(one_name(rest.at(last))))
+    b.push(binder(sep, block_sep, is_block))
+    b.push(value)
+
+    for _ in 0..<last
+        b.push(" }")
+
+    b.finish()
+end inline_text
+
+// The text of a new entry as its own line or lines, without the first line's indent or the last
+// line's new line: `key = value`, `a.b = value`, or the nested blocks a missing path needs.
+private entry_text(rest: Buf[string], value: string, dotted: bool, sep: string, block_sep: string, is_block: bool,
+                   column: Option[usize], indent: string, unit: string, nl: string) -> string
+    val first = if dotted then key_of(rest) else key_of(one_name(rest.at(0)))
+    val pad = column match
+        Some(c) ->
+            val used = chars(indent.bytes, 0, indent.bytes.len) + chars(first.bytes, 0, first.bytes.len)
+
+            if c > used then spaces(c - used) else " "
+        None -> " "
+
+    if dotted || rest.len() == 1 then
+        val bind = binder(sep, block_sep, is_block).bytes
+
+        // The pad stands for the binder's leading space; `:` is written against its key.
+        if bind[0] != u8(' ') then return s"$first${from_utf8_unchecked(bind)}$value"
+
+        return s"$first$pad${from_utf8_unchecked(bind[1..<bind.len])}$value"
+
+    var b = str_builder()
+    var depth = indent
+    val last = rest.len() - 1
+
+    b.push(s"$first$pad{$nl")
+
+    for i in 1..<last
+        depth = s"$depth$unit"
+        b.push(s"$depth${key_of(one_name(rest.at(i)))} {$nl")
+
+    val inner = s"$depth$unit"
+
+    b.push(s"$inner${key_of(one_name(rest.at(last)))}${binder(sep, block_sep, is_block)}$value$nl")
+
+    var i = rest.len() - 2
+
+    while i > 0
+        b.push(s"$depth}$nl")
+        depth = cut_unit(depth, unit)
+        i -= 1
+
+    b.push(s"$indent}")
+    b.finish()
+end entry_text
+
+// What stands between a new key and its value: ` = `, `: ` as JSON writes it, or one space before a
+// block written the way the siblings write blocks.
+private binder(sep: string, block_sep: string, is_block: bool) -> string
+    val written = if is_block then block_sep else sep
+
+    if written.is_empty() then " " elif written == ":" then ": " else " = "
+
+// A key as a new entry writes it: each segment bare where the reader would read it back as the same
+// one segment, quoted otherwise. `include` stays bare, since only `include` followed by a file is the
+// directive.
+private key_of(names: Buf[string]) -> string
+    var b = str_builder()
+
+    for i in 0..<names.len()
+        if i > 0 then b.push(".")
+
+        val k = names.at(i)
+        var bare = !k.is_empty()
+
+        for j in 0..<k.bytes.len
+            if k.bytes[j] == u8('.') || !unquoted_byte(k.bytes, j) then bare = false
+
+        b.push(if bare then k else quoted(k))
+    end for
+
+    b.finish()
+end key_of
+
+private cut_unit(s: string, unit: string) -> string =
+    if s.bytes.len >= unit.bytes.len then from_utf8_unchecked(s.bytes[0..<s.bytes.len - unit.bytes.len]) else ""
+
+// Whether a missing path is written as a dotted key: where a sibling already writes part of it that
+// way, or, failing a sibling, where the file writes any dotted key at all.
+private writes_dotted(seen: Buf[Place], siblings: Buf[Entry], rest: Buf[string]) -> bool
+    for s in siblings
+        if common(s.names(), rest) > 0 then return s.path.len() > 1
+
+    for p in seen
+        if p.entry.path.len() > 1 then return true
+
+    false
+end writes_dotted
+
+// The column the siblings line their `=` (or `{`) up at: the one most of the siblings on lines of
+// their own share, where at least two share it and one of them is padded to reach it. A sibling with
+// a key too long for the column (`targets.x.linker_script = …` among `doc     =`) does not undo it.
+private aligned_column(b: []const u8, siblings: Buf[Entry]) -> Option[usize]
+    var cols: Buf[usize] = buf()
+    var pads: Buf[bool] = buf()
+
+    for s in siblings
+        val ls = line_start(b, s.span.start)
+
+        if all_blank(b, ls, s.span.start) then
+            val key_end = s.path.at(s.path.len() - 1).span.end
+            val at = first_after_blanks(b, key_end)
+
+            cols.push(chars(b, ls, at))
+            pads.push(at > key_end + 1)
+        end if
+    end for
+
+    var best: Option[usize] = None
+    var most = 1
+
+    for i in 0..<cols.len()
+        var count = 0
+        var padded = false
+
+        for j in 0..<cols.len()
+            if cols.at(j) == cols.at(i) then
+                count += 1
+
+                if pads.at(j) then padded = true
+
+        if count > most && padded then
+            most = count
+            best = Some(cols.at(i))
+    end for
+
+    best
+end aligned_column
+
+// The indent one level of the file adds: what an entry's line has beyond its block's line, from the
+// first entry of a braced block that shows it, or two spaces.
+private indent_unit(b: []const u8, seen: Buf[Place]) -> string
+    for p in seen
+        if braced(p.block) then
+            val ls = line_start(b, p.entry.span.start)
+            val outer = leading_blanks(b, line_start(b, p.block.span.start))
+            val inner = leading_blanks(b, ls)
+
+            if all_blank(b, ls, p.entry.span.start) && inner.bytes.len > outer.bytes.len && inner.starts_with(outer) then
+                return from_utf8_unchecked(inner.bytes[outer.bytes.len..<inner.bytes.len])
+        end if
+    end for
+
+    "  "
+end indent_unit
+
+private byte_after_key(b: []const u8, e: Entry) -> u8
+    val at = first_after_blanks(b, e.path.at(e.path.len() - 1).span.end)
+
+    if at < b.len then b[at] else 0
+
+// -- the check every edit ends with --------------------------------------------------------------
+
+// The edit applied, and the result read back: a splice that left something the reader refuses, or
+// that did not put the path where it was asked to be, is a mistake of this file, never written.
+private checked(src: Source, target: Buf[string], start: usize, end: usize, insert: string, present: bool) -> Result[Edit, Diagnostic]
+    val b = src.bytes
+    val text = s"${from_utf8_unchecked(b[0..<start])}$insert${from_utf8_unchecked(b[end..<b.len])}"
+    val after = source_of(src.name, text)
+
+    syntax(after) match
+        Ok(tree) ->
+            val seen = entries_of(tree)?
+            val found = !places(seen, target).is_empty()
+
+            if found != present then
+                return Err(error(point(start), s"the edit of `${path_text(target)}` did not come out as asked; the document is unchanged"))
+        Err(d) ->
+            return Err(error(point(start), s"the edit would leave a document that does not read: ${d.message}"))
+
+    Ok(Edit(start, end, insert, text))
+end checked
+
+// A value given to an edit must read as exactly one value, with nothing after it -- not a comment
+// either, which would swallow whatever follows the value where it is put.
+private one_value(value: string) -> Result[unit, Diagnostic]
+    val src = source_of("value", s"x = $value")
+
+    syntax(src) match
+        Ok(tree) ->
+            val n = entries_in(tree.root)
+
+            if n.len() == 1 && n.at(0).path.len() == 1 && n.at(0).value.span.end == src.bytes.len then return Ok(())
+
+            Err(error(point(0), s"`$value` is not one value"))
+        Err(d) -> Err(error(point(0), s"`$value` is not one value").with_note(d.message))
+end one_value
+
+// -- text ----------------------------------------------------------------------------------------
+
+private entries_in(n: Node) -> Buf[Entry]
+    n.kind match
+        NBlock(entries, _) -> entries
+        _ -> buf()
+
+private braced(n: Node) -> bool = n.kind match
+    NBlock(_, on) -> on
+    _ -> false
+
+private line_of(src: Source, at: usize) -> usize = src.locate(at).line
+
+private line_start(b: []const u8, at: usize) -> usize
+    var i = at
+
+    while i > 0 && b[i - 1] != u8('\n') && b[i - 1] != u8('\r')
+        i -= 1
+
+    i
+end line_start
+
+private line_end(b: []const u8, at: usize) -> usize
+    var i = at
+
+    while i < b.len && b[i] != u8('\n') && b[i] != u8('\r')
+        i += 1
+
+    i
+end line_end
+
+private past_newline(b: []const u8, at: usize) -> usize
+    if at + 1 < b.len && b[at] == u8('\r') && b[at + 1] == u8('\n') then return at + 2
+
+    if at < b.len then at + 1 else at
+
+private before_newline(b: []const u8, at: usize) -> usize
+    if at >= 2 && b[at - 2] == u8('\r') && b[at - 1] == u8('\n') then return at - 2
+
+    if at >= 1 then at - 1 else at
+
+private has_newline(b: []const u8, from: usize, to: usize) -> bool
+    for i in from..<to
+        if b[i] == u8('\n') || b[i] == u8('\r') then return true
+
+    false
+
+private all_blank(b: []const u8, from: usize, to: usize) -> bool
+    for i in from..<to
+        if b[i] != u8(' ') && b[i] != u8('\t') then return false
+
+    true
+
+private first_after_blanks(b: []const u8, from: usize) -> usize
+    var i = from
+
+    while i < b.len && (b[i] == u8(' ') || b[i] == u8('\t'))
+        i += 1
+
+    i
+end first_after_blanks
+
+private leading_blanks(b: []const u8, ls: usize) -> string = from_utf8_unchecked(b[ls..<first_after_blanks(b, ls)])
+
+// The new line a document writes: `\r\n` where its first line ends that way.
+private newline_of(b: []const u8) -> string
+    for i in 0..<b.len
+        if b[i] == u8('\n') then return if i > 0 && b[i - 1] == u8('\r') then "\r\n" else "\n"
+
+    "\n"
+
+// Characters, not bytes, from `from` to `to`: what a column counts.
+private chars(b: []const u8, from: usize, to: usize) -> usize
+    var n: usize = 0
+
+    for i in from..<to
+        if (b[i] & 0xc0) != 0x80 then n += 1
+
+    n
+
+private spaces(n: usize) -> string
+    var b = str_builder()
+
+    for _ in 0..<n
+        b.push(" ")
+
+    b.finish()
+
+private common(a: Buf[string], b: Buf[string]) -> usize
+    var n: usize = 0
+
+    while n < a.len() && n < b.len() && a.at(n) == b.at(n)
+        n += 1
+
+    n
+
+private starts_with(full: Buf[string], target: Buf[string]) -> bool = common(full, target) == target.len()
+
+private joined_names(prefix: Buf[string], path: Buf[string]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for p in prefix
+        out.push(p)
+
+    for p in path
+        out.push(p)
+
+    out
+end joined_names
+
+private first_names(path: Buf[string], n: usize) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<n
+        out.push(path.at(i))
+
+    out
+
+private rest_names(path: Buf[string], n: usize) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in n..<path.len()
+        out.push(path.at(i))
+
+    out
+
+private one_name(name: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    out.push(name)
+    out

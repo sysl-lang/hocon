@@ -1,0 +1,618 @@
+module sh.sysl.hocon
+@tests
+
+import sh.sysl.parsing.{Diagnostic, source_of}
+import sysl.buf.{Buf, buf}
+import sysl.env
+import sysl.fs.{read_text, walk}
+import sysl.text.{from_utf8_unchecked, str_builder}
+
+// The lossless tree and the edits made over it. Every edit is checked twice over: its whole output
+// against the text it should be, and every byte outside its splice against the original -- so an edit
+// that got the answer right by rewriting a line it should not have touched still fails.
+
+// What an edit came to: the new document, or `refused: line:column message`.
+private outcome(text: string, r: Result[Edit, Diagnostic]) -> string
+    val src = source_of("t.conf", text)
+
+    r match
+        Ok(e) ->
+            val b = text.bytes
+            val out = e.text.bytes
+
+            assert_eq(out.len, b.len - (e.end - e.start) + e.insert.bytes.len, "the splice accounts for every byte")
+
+            for i in 0..<e.start
+                assert_eq(out[i], b[i], "a byte before the splice moved")
+
+            for i in 0..<b.len - e.end
+                assert_eq(out[out.len - 1 - i], b[b.len - 1 - i], "a byte after the splice moved")
+
+            e.text
+        Err(d) -> s"refused: ${src.locate(d.span.start)} ${d.message}"
+end outcome
+
+private replaced(text: string, path: string, value: string) -> string =
+    outcome(text, replace_value(source_of("t.conf", text), path, value))
+
+private added(text: string, path: string, value: string) -> string =
+    outcome(text, add_entry(source_of("t.conf", text), path, value))
+
+private removed(text: string, path: string) -> string =
+    outcome(text, remove_entry(source_of("t.conf", text), path))
+
+private set(text: string, path: string, value: string) -> string =
+    outcome(text, set_value(source_of("t.conf", text), path, value))
+
+// The lines one text changed into another, as `@first line`, then `-` for each line taken out and
+// `+` for each put in. Everything before and after is the same, which is what makes it a golden test
+// of a whole file in a few lines.
+private change(before: string, after: string) -> string
+    val a = lines_of(before)
+    val z = lines_of(after)
+    var p: usize = 0
+
+    while p < a.len() && p < z.len() && a.at(p) == z.at(p)
+        p += 1
+
+    var s: usize = 0
+
+    while s < a.len() - p && s < z.len() - p && a.at(a.len() - 1 - s) == z.at(z.len() - 1 - s)
+        s += 1
+
+    var b = str_builder()
+
+    b.push(s"@${p + 1}\n")
+
+    for i in p..<a.len() - s
+        b.push(s"-${a.at(i)}\n")
+
+    for i in p..<z.len() - s
+        b.push(s"+${z.at(i)}\n")
+
+    b.finish()
+end change
+
+private lines_of(text: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    val b = text.bytes
+    var from: usize = 0
+
+    for i in 0..<b.len
+        if b[i] == u8('\n') then
+            out.push(from_utf8_unchecked(b[from..<i]))
+            from = i + 1
+
+    out.push(from_utf8_unchecked(b[from..<b.len]))
+    out
+end lines_of
+
+private manifests_dir() -> string
+    val here = __FILE__
+    val cut = here.last_index_of("/sh/sysl/hocon/").expect("this file sits under sh/sysl/hocon")
+
+    s"${here[0..<cut]}/testdata/manifests"
+
+private manifest(name: string) -> string = read_text(s"${manifests_dir()}/$name.hocon").unwrap()
+
+// A golden edit of a real manifest, as the lines it changed.
+private changed(name: string, edit: Result[Edit, Diagnostic]) -> string
+    val text = manifest(name)
+    val out = outcome(text, edit)
+
+    if out.starts_with("refused: ") then out else change(text, out)
+
+private replaced_in(name: string, path: string, value: string) -> string
+    val text = manifest(name)
+
+    changed(name, replace_value(source_of(name, text), path, value))
+
+private added_in(name: string, path: string, value: string) -> string
+    val text = manifest(name)
+
+    changed(name, add_entry(source_of(name, text), path, value))
+
+private removed_in(name: string, path: string) -> string
+    val text = manifest(name)
+
+    changed(name, remove_entry(source_of(name, text), path))
+
+// -- the lossless tree ---------------------------------------------------------------------------
+
+private round_trips(text: string) -> bool
+    syntax(source_of("t.conf", text)) match
+        Ok(tree) -> tree.tiles() && tree.printed() == text
+        Err(_) -> false
+
+@test("the lossless tree prints back every byte it read")
+syntax_round_trips()
+    assert(round_trips(""))
+    assert(round_trips("\n\n  \t\n"))
+    assert(round_trips("# only a comment"))
+    assert(round_trips("// one\n# two\n"))
+    assert(round_trips("\u{feff}a = 1\n"))
+    assert(round_trips("a = 1\r\nb { c = 2 }\r\n"))
+    assert(round_trips("a.b.\"c.d\" : [1, 2, { e = 3 }],, f = ${a.b} tail  # x\n"))
+    assert(round_trips("s = \"\"\"line one\n# not a comment\n\"\"\" // after\n"))
+    assert(round_trips("{ a = 1 }"))
+    assert(round_trips("[1, 2]\n"))
+    assert(round_trips("x = \"héllo wörld\" # ünï\n"))
+    assert(round_trips("a = hello   world  \t\n"))
+
+@test("every byte of a document is in exactly one piece, and each piece says what it is")
+syntax_pieces()
+    val text = "a.b = \"x\" # c\nd { e = ${a.b} }\n"
+    val tree = syntax(source_of("t.conf", text)).unwrap()
+    var b = str_builder()
+
+    for p in tree.pieces
+        val kind = p.kind match
+            PBlank -> "_"
+            PNewline -> "n"
+            PComment -> "c"
+            PPunct -> tree.text_of(p.span)
+            PKey -> "k"
+            PBare -> "w"
+            PQuoted -> "q"
+            PRef -> "r"
+            PMark -> "m"
+
+        b.push(kind)
+
+    assert_eq(b.finish(), "k.k_=_q_cnk_{_k_=_r_}n")
+    assert(tree.tiles())
+
+@test("the tree keeps each entry's key segments and spans, and the value tree is built from it")
+syntax_entries()
+    val text = "a.\"b.c\" = 1\nd { e = x y }\n"
+    val tree = syntax(source_of("t.conf", text)).unwrap()
+
+    tree.root.kind match
+        NBlock(entries, braced) ->
+            assert(!braced)
+            assert_eq(entries.len(), 2usize)
+            assert_eq(path_text(entries.at(0).names()), "a.\"b.c\"")
+            assert_eq(tree.text_of(entries.at(0).span), "a.\"b.c\" = 1")
+            assert_eq(tree.text_of(entries.at(0).path.at(1).span), "\"b.c\"")
+            assert_eq(tree.text_of(entries.at(1).span), "d { e = x y }")
+
+            entries.at(1).value.kind match
+                NBlock(inner, on) ->
+                    assert(on)
+                    assert_eq(tree.text_of(inner.at(0).value.span), "x y")
+                _ -> panic("d is a block")
+        _ -> panic("the root is a block")
+
+    val doc = values_of(tree)
+
+    assert_eq(doc.root.get("d").unwrap().get("e").unwrap().as_text(), Some("x y"))
+    assert(same(doc.root, parse_unresolved(source_of("t.conf", text)).unwrap().root))
+
+@test("a block comment is not HOCON's, and is refused where it stands")
+syntax_no_block_comment()
+    val src = source_of("t.conf", "/* note */\na = 1\n")
+
+    syntax(src) match
+        Ok(_) -> panic("read")
+        Err(d) -> assert_eq(s"${src.locate(d.span.start)} ${d.message}", "1:2 '/' is followed by '*' rather than '=' or a block")
+
+@test("a key path is read as a document writes one")
+syntax_path_of()
+    assert_eq(path_text(path_of("a.b").unwrap()), "a.b")
+    assert_eq(path_of("a.\"b.c\"").unwrap().len(), 2usize)
+    assert_eq(path_of("a.\"b.c\"").unwrap().at(1), "b.c")
+
+    path_of("a..b") match
+        Ok(_) -> panic("read")
+        Err(d) -> assert_eq(d.message, "'.' cannot begin a key")
+
+    path_of("a b") match
+        Ok(_) -> panic("read")
+        Err(d) -> assert_eq(d.message, "`a b` is not a key path")
+
+@test("every org manifest in testdata prints back byte for byte and reads to the same values")
+syntax_testdata_round_trip()
+    var count = 0
+
+    for item in walk(manifests_dir())
+        val e = item.unwrap()
+
+        if !e.is_dir() && e.path.ends_with(".hocon") then
+            val text = read_text(e.path).unwrap()
+            val src = source_of(e.path, text)
+            val tree = syntax(src).unwrap()
+
+            assert(tree.tiles(), e.path)
+            assert_eq(tree.printed(), text, e.path)
+            assert(same(values_of(tree).root, parse_unresolved(src).unwrap().root), e.path)
+            count += 1
+        end if
+    end for
+
+    assert_eq(count, 6)
+
+// Every manifest under a directory, round-tripped: run with `HOCON_ROUND_TRIP_DIR=~/dev/sysl-lang`.
+// Without it there is nothing to walk and the test has nothing to say.
+@test("every manifest under HOCON_ROUND_TRIP_DIR prints back byte for byte")
+syntax_org_round_trip()
+    val root = env.get("HOCON_ROUND_TRIP_DIR") match
+        Some(d) -> d
+        None -> return
+
+    var read = 0
+    var refused = 0
+    var bad = str_builder()
+
+    for item in walk(root)
+        val e = item.unwrap()
+        val name = e.path
+
+        if !e.is_dir() && (name.ends_with("/sysl.hocon") || name.ends_with("/package.hocon")) &&
+                !name.contains("/.") && !name.contains("/target/") then
+            val text = read_text(name).unwrap()
+
+            syntax(source_of(name, text)) match
+                Ok(tree) ->
+                    read += 1
+
+                    if !tree.tiles() || tree.printed() != text then bad.push(s"$name\n")
+                Err(_) -> refused += 1
+        end if
+    end for
+
+    print(s"round trip: $read manifests read, $refused refused by the reader")
+    assert_eq(bad.finish(), "")
+
+// -- replace -------------------------------------------------------------------------------------
+
+@test("replace rewrites only the value's bytes")
+edit_replace()
+    assert_eq(replaced("a = 1\nb = 2\n", "b", "3"), "a = 1\nb = 3\n")
+    assert_eq(replaced("a = 1 # keep\n", "a", "\"x y\""), "a = \"x y\" # keep\n")
+    assert_eq(replaced("a = hello world\n", "a", "bye"), "a = bye\n")
+    assert_eq(replaced("a : 1\n", "a", "2"), "a : 2\n")
+    assert_eq(replaced("a = ${b} c\nb = 1\n", "a", "2"), "a = 2\nb = 1\n")
+
+@test("a block written without '=' gains one when a value that is not a block replaces it")
+edit_replace_block()
+    assert_eq(replaced("a {\n  b = 1\n}\n", "a", "5"), "a = 5\n")
+    assert_eq(replaced("a { b = 1 }\n", "a", "{ c = 2 }"), "a { c = 2 }\n")
+    assert_eq(replaced("a = { b = 1 }\n", "a", "5"), "a = 5\n")
+
+@test("an edit next to a brace that shares a line keeps to its own block")
+edit_brace_on_the_line()
+    assert_eq(added("a {\n  b = 1 }\n", "a.c", "2"), "a {\n  b = 1\n  c = 2 }\n")
+    assert_eq(removed("a {\n  b = 1 }\nc = 2\n", "a.b"), "a {\n   }\nc = 2\n")
+    assert_eq(removed("a {\n  b = 1\n} # end\nc = 2\n", "a"), "c = 2\n")
+    assert_eq(added("{ a = 1 }\n", "b", "2"), "{ a = 1, b = 2 }\n")
+    assert_eq(added("{\n  a = 1\n}\n", "b", "2"), "{\n  a = 1\n  b = 2\n}\n")
+    assert_eq(removed("{\n  a = 1\n  b = 2\n}\n", "a"), "{\n  b = 2\n}\n")
+
+@test("set replaces where the path is written and adds where it is not")
+edit_set()
+    assert_eq(set("a {\n  b = 1\n}\n", "a.b", "2"), "a {\n  b = 2\n}\n")
+    assert_eq(set("a {\n  b = 1\n}\n", "a.c", "2"), "a {\n  b = 1\n  c = 2\n}\n")
+
+// -- add -----------------------------------------------------------------------------------------
+
+@test("add goes after the sibling sharing the most of the key, in the siblings' indent")
+edit_add_anchor()
+    assert_eq(added("a {\n    x.p = 1\n    y = 2\n}\n", "a.x.q", "3"), "a {\n    x.p = 1\n    x.q = 3\n    y = 2\n}\n")
+    assert_eq(added("a {\n\tb = 1\n}\n", "a.c", "2"), "a {\n\tb = 1\n\tc = 2\n}\n")
+    assert_eq(added("a = 1\nb = 2\n", "c", "3"), "a = 1\nb = 2\nc = 3\n")
+
+@test("add lines its '=' up with the siblings' where they are lined up, and only then")
+edit_add_aligned()
+    val pkg = "package {\n  name    = \"x\"\n  version = \"1\"\n}\n"
+
+    assert_eq(added(pkg, "package.sysl", "\"0.6.0\""), "package {\n  name    = \"x\"\n  version = \"1\"\n  sysl    = \"0.6.0\"\n}\n")
+    // A key longer than the column takes one space, and nothing already there moves.
+    assert_eq(added(pkg, "package.description", "\"y\""), "package {\n  name    = \"x\"\n  version = \"1\"\n  description = \"y\"\n}\n")
+    // Unpadded siblings are not lined up, whatever columns they happen to reach.
+    assert_eq(added("p {\n  ab = 1\n  cd = 2\n}\n", "p.e", "3"), "p {\n  ab = 1\n  cd = 2\n  e = 3\n}\n")
+    // Blocks lined up on their '{' are followed too.
+    assert_eq(added("d {\n  a    { v = 1 }\n  long { v = 2 }\n}\n", "d.b", "{ v = 3 }"),
+        "d {\n  a    { v = 1 }\n  long { v = 2 }\n  b    { v = 3 }\n}\n")
+
+@test("add follows the siblings' separator: ':' where they write it, none before a block where they write none")
+edit_add_separator()
+    assert_eq(added("a {\n  b: 1\n}\n", "a.c", "2"), "a {\n  b: 1\n  c: 2\n}\n")
+    assert_eq(added("a { b: 1 }\n", "a.c", "2"), "a { b: 1, c: 2 }\n")
+    assert_eq(added("d {\n  x { v = 1 }\n}\n", "d.y", "{ v = 2 }"), "d {\n  x { v = 1 }\n  y { v = 2 }\n}\n")
+    assert_eq(added("d {\n  x = { v = 1 }\n}\n", "d.y", "{ v = 2 }"), "d {\n  x = { v = 1 }\n  y = { v = 2 }\n}\n")
+
+@test("a missing block is written nested, or dotted where the file writes dotted keys")
+edit_add_missing_block()
+    assert_eq(added("a = 1\n", "b.c.d", "2"), "a = 1\nb {\n  c {\n    d = 2\n  }\n}\n")
+    assert_eq(added("x.y = 1\n", "b.c", "2"), "x.y = 1\nb.c = 2\n")
+    assert_eq(added("p {\n  a = 1\n}\n", "p.q.r", "2"), "p {\n  a = 1\n  q {\n    r = 2\n  }\n}\n")
+
+@test("a new key is written bare where it reads back as itself, and quoted where it would not")
+edit_add_key_spelling()
+    assert_eq(added("a = 1\n", "include", "2"), "a = 1\ninclude = 2\n")
+    assert_eq(added("a = 1\n", "\"two words\"", "2"), "a = 1\n\"two words\" = 2\n")
+    assert_eq(added("a = 1\n", "\"x=y\"", "2"), "a = 1\n\"x=y\" = 2\n")
+    assert_eq(added("x.y = 1\n", "x.\"p.q\"", "2"), "x.y = 1\nx.\"p.q\" = 2\n")
+    assert_eq(added("a = 1\n", "v1.0", "2"), "a = 1\nv1 {\n  0 = 2\n}\n")
+
+@test("an inline block gains ', c = 3' in place")
+edit_add_inline()
+    assert_eq(added("a { b = 1 }\n", "a.c", "3"), "a { b = 1, c = 3 }\n")
+    assert_eq(added("a {}\n", "a.b", "1"), "a { b = 1 }\n")
+    assert_eq(added("a { }\n", "a.b", "1"), "a { b = 1 }\n")
+    assert_eq(added("a { b = 1 } # after\n", "a.c", "3"), "a { b = 1, c = 3 } # after\n")
+    assert_eq(added("a { b = 1 }\n", "a.x.y", "2"), "a { b = 1, x { y = 2 } }\n")
+
+@test("an inline block that would pass 100 columns is reflowed, that one entry and nothing else")
+edit_add_reflow()
+    val deps = "dependencies {\n  cstd { git = \"github.com/sysl-lang/cstd\", version = \"0.1.7\", if = \"!libc\" }\n  z = 1\n}\n"
+
+    assert_eq(added(deps, "dependencies.cstd.features", "[sim, cdc, msc, hid]"),
+        "dependencies {\n  cstd {\n    git = \"github.com/sysl-lang/cstd\"\n    version = \"0.1.7\"\n    if = \"!libc\"\n    features = [sim, cdc, msc, hid]\n  }\n  z = 1\n}\n")
+
+    // Exactly 100 columns stays on its line; 101 does not.
+    val row = s"a { b = \"${repeat_x(81)}\" }\n"
+
+    assert_eq(added(row, "a.c", "1"), s"a { b = \"${repeat_x(81)}\", c = 1 }\n")
+    assert_eq(added(row, "a.c", "12"), s"a {\n  b = \"${repeat_x(81)}\"\n  c = 12\n}\n")
+
+private repeat_x(n: int) -> string
+    var b = str_builder()
+
+    for _ in 0..<n
+        b.push("x")
+
+    b.finish()
+
+// -- remove --------------------------------------------------------------------------------------
+
+@test("remove takes the entry's line, the comment lines directly above it, and its trailing comment")
+edit_remove_lines()
+    assert_eq(removed("x = 1\n\n// about a\n// more\na = 1 // trailing\nb = 2\n", "a"), "x = 1\n\nb = 2\n")
+    // A blank line ends what the comment above is about.
+    assert_eq(removed("// header\n\na = 1\nb = 2\n", "a"), "// header\n\nb = 2\n")
+    // A line with an entry on it is not a comment above.
+    assert_eq(removed("x = 1 # x's\na = 2\n", "a"), "x = 1 # x's\n")
+    // A comment-looking line inside a triple-quoted string is not a comment.
+    assert_eq(removed("s = \"\"\"\n# text\n\"\"\"\na = 1\n", "a"), "s = \"\"\"\n# text\n\"\"\"\n")
+    assert_eq(removed("a = 1,\nb = 2\n", "a"), "b = 2\n")
+
+@test("an entry sharing its line loses only itself and one comma")
+edit_remove_shared_line()
+    assert_eq(removed("a = 1, b = 2\nc = 3\n", "a"), "b = 2\nc = 3\n")
+    assert_eq(removed("a = 1, b = 2\nc = 3\n", "b"), "a = 1\nc = 3\n")
+    assert_eq(removed("x { a = 1, b = 2, c = 3 }\n", "x.b"), "x { a = 1, c = 3 }\n")
+
+@test("removing a path written only inside a dotted key removes that entry")
+edit_remove_implied()
+    assert_eq(removed("a.b = 1\nc = 2\n", "a"), "c = 2\n")
+
+// -- refusals ------------------------------------------------------------------------------------
+
+@test("one path written in two places is refused, naming both lines")
+edit_refuse_two_places()
+    val text = "a.b = 1\na {\n  b = 2\n}\n"
+    val why = "3:3 `a.b` is written in two places, lines 1 and 3, and an edit would have to guess which one is meant"
+
+    assert_eq(replaced(text, "a.b", "3"), s"refused: $why")
+    assert_eq(removed(text, "a.b"), s"refused: $why")
+    assert_eq(added(text, "a.c", "3"), "refused: 2:1 `a` is written in two places, lines 1 and 2, and an edit would have to guess which one is meant")
+    assert_eq(added("d { x = 1 }\nd { y = 2 }\n", "d.z", "3"), "refused: 2:1 `d` is written in two places, lines 1 and 2, and an edit would have to guess which one is meant")
+    assert_eq(replaced("a = 1\na = 2\n", "a", "3"), "refused: 2:1 `a` is written in two places, lines 1 and 2, and an edit would have to guess which one is meant")
+
+@test("the refusals of an edit that cannot be made say why")
+edit_refusals()
+    assert_eq(replaced("a = 1\n", "b", "2"), "refused: 1:1 there is no `b` to replace")
+    assert_eq(removed("a = 1\n", "b"), "refused: 1:1 there is no `b` to remove")
+    assert_eq(removed("a = 1\n", "a.b"), "refused: 1:1 there is no `a.b` to remove")
+    assert_eq(added("a {\n  b = 1\n}\n", "a.b", "2"), "refused: 2:3 `a.b` is already set, on line 2: replace it rather than add it")
+    assert_eq(added("a = 1\n", "a.b", "2"), "refused: 1:5 `a` is set on line 1 to a value that is not an object, so `a.b` cannot be added under it")
+    assert_eq(replaced("a.b = 1\n", "a", "2"),
+        "refused: 1:1 `a` is written only as part of the key `a.b` on line 1, so it has no value of its own to replace")
+    assert_eq(replaced("[1, 2]\n", "a", "2"), "refused: 1:1 the document is an array, and only the entries of an object can be edited")
+    assert_eq(replaced("a = 1\n", "a", "1, b = 2"), "refused: 1:1 `1, b = 2` is not one value")
+    assert_eq(replaced("a = 1\n", "a", "{"), "refused: 1:1 `{` is not one value")
+    assert_eq(replaced("a = 1\n", "a", ""), "refused: 1:1 `` is not one value")
+    assert_eq(added("a = 1\n", "b", "x\ny = 2"), "refused: 1:1 `x\ny = 2` is not one value")
+    assert_eq(replaced("a { b = 1, c = 2 }\n", "a.b", "x # c"), "refused: 1:1 `x # c` is not one value")
+    assert_eq(replaced("a = 1\n", "a", "2 "), "refused: 1:1 `2 ` is not one value")
+    assert_eq(replaced("a = 1\n", "a", "\"\"\"two\nlines\"\"\""), "a = \"\"\"two\nlines\"\"\"\n")
+    assert_eq(replaced("a = {\n", "a", "1"), "refused: 2:1 unclosed object — expected '}'")
+
+    replace_value(source_of("t.conf", "a = 1\n"), "a..b", "1") match
+        Ok(_) -> panic("edited")
+        Err(d) -> assert_eq(d.message, "'.' cannot begin a key")
+
+// -- the matrix: each edit against each shape a document can take -------------------------------
+
+@test("matrix: a nested block")
+matrix_nested()
+    val t = "a {\n  b {\n    c = 1\n  }\n}\n"
+
+    assert_eq(replaced(t, "a.b.c", "2"), "a {\n  b {\n    c = 2\n  }\n}\n")
+    assert_eq(replaced(t, "a.b", "5"), "a {\n  b = 5\n}\n")
+    assert_eq(added(t, "a.b.d", "2"), "a {\n  b {\n    c = 1\n    d = 2\n  }\n}\n")
+    assert_eq(added(t, "a.e", "3"), "a {\n  b {\n    c = 1\n  }\n  e = 3\n}\n")
+    assert_eq(added(t, "a.x.y", "1"), "a {\n  b {\n    c = 1\n  }\n  x {\n    y = 1\n  }\n}\n")
+    assert_eq(removed(t, "a.b.c"), "a {\n  b {\n  }\n}\n")
+    assert_eq(removed(t, "a.b"), "a {\n}\n")
+
+@test("matrix: dotted keys")
+matrix_dotted()
+    val t = "a.b.c = 1\na.b.d = 2\n"
+
+    assert_eq(replaced(t, "a.b.d", "3"), "a.b.c = 1\na.b.d = 3\n")
+    assert_eq(added(t, "a.b.e", "4"), "a.b.c = 1\na.b.d = 2\na.b.e = 4\n")
+    assert_eq(added(t, "z.y", "1"), "a.b.c = 1\na.b.d = 2\nz.y = 1\n")
+    assert_eq(removed(t, "a.b.c"), "a.b.d = 2\n")
+    assert_eq(replaced(t, "a.b", "1"), "refused: 2:1 `a.b` is written in two places, lines 1 and 2, and an edit would have to guess which one is meant")
+
+@test("matrix: an inline block")
+matrix_inline()
+    val t = "a { b = 1, c = 2 }\n"
+
+    assert_eq(replaced(t, "a.c", "3"), "a { b = 1, c = 3 }\n")
+    assert_eq(added(t, "a.d", "4"), "a { b = 1, c = 2, d = 4 }\n")
+    assert_eq(removed(t, "a.b"), "a { c = 2 }\n")
+    assert_eq(removed(t, "a.c"), "a { b = 1 }\n")
+    assert_eq(removed("a { b = 1 }\n", "a.b"), "a {}\n")
+
+@test("matrix: an empty file")
+matrix_empty()
+    assert_eq(replaced("", "a", "1"), "refused: 1:1 there is no `a` to replace")
+    assert_eq(removed("", "a"), "refused: 1:1 there is no `a` to remove")
+    assert_eq(added("", "a", "1"), "a = 1\n")
+    assert_eq(added("", "a.b", "1"), "a {\n  b = 1\n}\n")
+    assert_eq(added("// only a comment\n", "a", "1"), "// only a comment\na = 1\n")
+
+@test("matrix: the last entry with no new line after it")
+matrix_no_trailing_newline()
+    val t = "a = 1\nb = 2"
+
+    assert_eq(replaced(t, "b", "3"), "a = 1\nb = 3")
+    assert_eq(added(t, "c", "3"), "a = 1\nb = 2\nc = 3")
+    assert_eq(removed(t, "b"), "a = 1")
+    assert_eq(removed(t, "a"), "b = 2")
+    assert_eq(added("a { b = 1 }", "a.c", "2"), "a { b = 1, c = 2 }")
+    assert_eq(added("# c", "a", "1"), "# c\na = 1")
+
+@test("matrix: CRLF line endings")
+matrix_crlf()
+    val t = "a {\r\n  b = 1\r\n}\r\n"
+
+    assert_eq(replaced(t, "a.b", "2"), "a {\r\n  b = 2\r\n}\r\n")
+    assert_eq(added(t, "a.c", "3"), "a {\r\n  b = 1\r\n  c = 3\r\n}\r\n")
+    assert_eq(added(t, "x.y", "3"), "a {\r\n  b = 1\r\n}\r\nx {\r\n  y = 3\r\n}\r\n")
+    assert_eq(removed(t, "a.b"), "a {\r\n}\r\n")
+    assert_eq(removed("# about a\r\na = 1\r\nb = 2\r\n", "a"), "b = 2\r\n")
+    assert_eq(removed("x = 1\r\na = 1", "a"), "x = 1")
+
+@test("matrix: a comment between key and value")
+matrix_comment_between()
+    // HOCON has no place for a comment between a key and its value: the file does not read, and
+    // every edit hands on the reader's refusal unchanged.
+    val t = "a = # note\n  1\n"
+    val why = "refused: 1:5 a value was expected"
+
+    assert_eq(replaced(t, "a", "2"), why)
+    assert_eq(added(t, "b", "2"), why)
+    assert_eq(removed(t, "a"), why)
+
+    // The nearest the file can come is a comment just inside the block's brace.
+    val u = "a { // about b\n  b = 1\n}\n"
+
+    assert_eq(replaced(u, "a.b", "2"), "a { // about b\n  b = 2\n}\n")
+    assert_eq(added(u, "a.c", "3"), "a { // about b\n  b = 1\n  c = 3\n}\n")
+    assert_eq(removed(u, "a.b"), "a { // about b\n}\n")
+
+@test("matrix: a quoted key holding a dot")
+matrix_quoted_dot()
+    val t = "\"a.b\" = 1\nx.\"y.z\" = 2\n"
+
+    assert_eq(replaced(t, "\"a.b\"", "3"), "\"a.b\" = 3\nx.\"y.z\" = 2\n")
+    assert_eq(replaced(t, "a.b", "3"), "refused: 1:1 there is no `a.b` to replace")
+    assert_eq(added(t, "\"c.d\"", "4"), "\"a.b\" = 1\nx.\"y.z\" = 2\n\"c.d\" = 4\n")
+    assert_eq(added(t, "x.\"w.v\"", "5"), "\"a.b\" = 1\nx.\"y.z\" = 2\nx.\"w.v\" = 5\n")
+    assert_eq(removed(t, "x.\"y.z\""), "\"a.b\" = 1\n")
+    assert_eq(removed(t, "\"a.b\""), "x.\"y.z\" = 2\n")
+
+@test("matrix: an array value")
+matrix_array()
+    val t = "a = [1, 2]\nb = [\n  3,\n  4\n]\n"
+
+    assert_eq(replaced(t, "a", "[5]"), "a = [5]\nb = [\n  3,\n  4\n]\n")
+    assert_eq(replaced(t, "b", "[]"), "a = [1, 2]\nb = []\n")
+    assert_eq(added(t, "c", "[x, y]"), "a = [1, 2]\nb = [\n  3,\n  4\n]\nc = [x, y]\n")
+    assert_eq(removed(t, "b"), "a = [1, 2]\n")
+    assert_eq(added(t, "a.x", "1"), "refused: 1:5 `a` is set on line 1 to a value that is not an object, so `a.x` cannot be added under it")
+    assert_eq(removed("a = [{ b = 1 }]\n", "a.b"), "refused: 1:1 there is no `a.b` to remove")
+
+@test("matrix: unicode in a string")
+matrix_unicode()
+    val t = "name = \"héllo wörld\" # ünï\nother = 1\n"
+
+    assert_eq(replaced(t, "name", "\"ça va\""), "name = \"ça va\" # ünï\nother = 1\n")
+    assert_eq(added(t, "x", "\"ü\""), "name = \"héllo wörld\" # ünï\nother = 1\nx = \"ü\"\n")
+    assert_eq(removed(t, "name"), "other = 1\n")
+    // A column counts characters, not bytes.
+    assert_eq(added("\"ü\"  = 1\nabcd = 2\n", "x", "3"), "\"ü\"  = 1\nabcd = 2\nx    = 3\n")
+    // 99 characters is still one line, though it is 179 bytes.
+    assert_eq(added(s"a { s = \"${repeat_u(80)}\" }\n", "a.c", "1"), s"a { s = \"${repeat_u(80)}\", c = 1 }\n")
+    assert_eq(added(s"a { s = \"${repeat_u(80)}\" }\n", "a.c", "123"), s"a {\n  s = \"${repeat_u(80)}\"\n  c = 123\n}\n")
+
+private repeat_u(n: int) -> string
+    var b = str_builder()
+
+    for _ in 0..<n
+        b.push("ü")
+
+    b.finish()
+
+@test("the README's edit example says what it claims")
+edit_readme_example()
+    val text = "package {\n  name    = \"app\"  // the name\n  version = \"0.1.0\"\n}\n"
+
+    assert_eq(added(text, "package.sysl", "\"0.6.0\""),
+        "package {\n  name    = \"app\"  // the name\n  version = \"0.1.0\"\n  sysl    = \"0.6.0\"\n}\n")
+
+// -- golden edits of real manifests --------------------------------------------------------------
+
+@test("golden: tinyusb's manifest")
+golden_tinyusb()
+    assert_eq(replaced_in("tinyusb", "package.version", "\"0.2.0\""), "@22\n-  version = \"0.1.1\"\n+  version = \"0.2.0\"\n")
+    assert_eq(added_in("tinyusb", "dependencies.hocon", "{ git = \"github.com/sysl-lang/hocon\", version = \"0.3.0\" }"),
+        "@28\n+  hocon { git = \"github.com/sysl-lang/hocon\", version = \"0.3.0\" }\n")
+    assert_eq(added_in("tinyusb", "features.device.c.tinyusb.include", "[\"x\"]"), "@157\n+    c.tinyusb.include = [\"x\"]\n")
+    assert_eq(replaced_in("tinyusb", "features.rp2040.if", "\"thumb\""), "@75\n-    if  = \"thumb && freestanding\"\n+    if  = \"thumb\"\n")
+    assert_eq(removed_in("tinyusb", "choices.speed"),
+        "@41\n-  speed { doc = \"the root port's fastest speed\", of = [full_speed, high_speed], default = full_speed }\n")
+    assert_eq(added_in("tinyusb", "choices.port.default", "rp2350"),
+        "@40\n-  port { doc = \"which USB controller TinyUSB drives\", of = [rp2040, rp2350, stm32h7, sim] }\n+  port {\n+    doc = \"which USB controller TinyUSB drives\"\n+    of = [rp2040, rp2350, stm32h7, sim]\n+    default = rp2350\n+  }\n")
+    assert_eq(added_in("tinyusb", "config.CFG_X", "1"), "@59\n+  CFG_X              = 1\n")
+
+@test("golden: skitter's manifest")
+golden_skitter()
+    assert_eq(added_in("skitter", "dependencies.hocon", "{ git = \"github.com/sysl-lang/hocon\", version = \"0.3.0\" }"),
+        "@39\n+  hocon { git = \"github.com/sysl-lang/hocon\", version = \"0.3.0\" }\n")
+    assert_eq(removed_in("skitter", "dependencies.toml"),
+        "@37\n-  // The settings file is TOML, read by this; it is written by `prefs.sysl` itself.\n-  toml { git = \"github.com/sysl-lang/toml\", version = \"0.1.3\" }\n")
+    assert_eq(replaced_in("skitter", "package.sysl", "\"0.6.0\""), "@31\n-  sysl = \"0.0.161\"\n+  sysl = \"0.6.0\"\n")
+    assert_eq(removed_in("skitter", "package.sysl"),
+        "@28\n-  // 0.0.161: an `#if` in a module keeps its declarations when the package is a dependency, a\n-  // `build-c` archive no longer leaves `sysl_wall_us` undefined, and `sysl.log.message_text` is what\n-  // the logcat sink renders with.\n-  sysl = \"0.0.161\"\n")
+
+@test("golden: cstd's manifest")
+golden_cstd()
+    assert_eq(added_in("cstd", "package.edition", "\"x\""), "@23\n+  edition = \"x\"\n")
+    assert_eq(removed_in("cstd", "package.sysl"), "@22\n-  sysl   = \"0.6.0\"\n")
+    assert_eq(replaced_in("cstd", "c.libc.libc", "false"),
+        "@30\n-  libc { export = [\"include\"], libc = true }\n+  libc { export = [\"include\"], libc = false }\n")
+    assert_eq(added_in("cstd", "test.features", "[sim]"), "@32\n+test {\n+  features = [sim]\n+}\n")
+    assert_eq(added_in("cstd", "c", "1"), "refused: 29:1 `c` is already set, on line 29: replace it rather than add it")
+
+@test("golden: skiff's tiny workspace manifest")
+golden_skiff()
+    assert_eq(replaced_in("skiff", "workspace", "[\"kernel\"]"),
+        "@8\n-workspace = [\"kernel\", \"arch/*\", \"chips/*\", \"boards/*\", \"tools/*\"]\n+workspace = [\"kernel\"]\n")
+    assert_eq(added_in("skiff", "exclude", "[\"old\"]"), "@9\n+exclude = [\"old\"]\n")
+    assert_eq(removed_in("skiff", "workspace"),
+        "@1\n-// skiff's workspace. A dependency only ever points down this list (ROADMAP.md, \"Layers\"):\n-//\n-//   kernel          the portable kernel: no architecture, chip or board in it\n-//   arch/<family>   one CPU family each: start-up, vectors, exceptions, the MPU, the FPU context\n-//   chips/<chip>    one chip each: memory map, clocks, interrupt numbers, peripheral drivers\n-//   boards/<board>  one program per board and core: ties the three together; link script, entry\n-//   tools/portable  the gate's proof that the kernel builds for every CPU family\n-workspace = [\"kernel\", \"arch/*\", \"chips/*\", \"boards/*\", \"tools/*\"]\n")
+
+@test("golden: a board manifest with dotted keys")
+golden_dotted()
+    assert_eq(added_in("qemu-an521", "features.core0.targets.thumb-freestanding-soft.entry", "\"_start\""),
+        "@35\n+    targets.thumb-freestanding-soft.entry = \"_start\"\n")
+    assert_eq(added_in("qemu-an521", "features.core1.targets.thumb-freestanding.extra", "1"),
+        "@42\n+      extra         = 1\n")
+    assert_eq(replaced_in("qemu-an521", "features.core0.targets.thumb-freestanding-soft.linker_script", "\"c0.ld\""),
+        "@34\n-    targets.thumb-freestanding-soft.linker_script = \"core0.ld\"\n+    targets.thumb-freestanding-soft.linker_script = \"c0.ld\"\n")
+    assert_eq(replaced_in("qemu-an521", "dependencies.kernel.options.cores", "4"),
+        "@11\n-  kernel { workspace = true, options = { cores = 2, tasks = 32 } }\n+  kernel { workspace = true, options = { cores = 4, tasks = 32 } }\n")
+    assert_eq(added_in("qemu-an521", "features.core0.color", "red"), "@35\n+    color   = red\n")
+    assert_eq(removed_in("qemu-an521", "features.core0.targets"), "@34\n-    targets.thumb-freestanding-soft.linker_script = \"core0.ld\"\n")
+
+@test("golden: a manifest with a quoted key holding a dot")
+golden_quoted()
+    assert_eq(replaced_in("yaml", "requires.pkg_config.\"yaml-0.1\"", "\"libyaml\""),
+        "@58\n-    \"yaml-0.1\" = \"libyaml — `brew install libyaml` on macOS, Debian's libyaml-dev, Arch's libyaml\"\n+    \"yaml-0.1\" = \"libyaml\"\n")
+    assert_eq(added_in("yaml", "requires.pkg_config.\"yaml-0.2\"", "\"x\""), "@59\n+    \"yaml-0.2\" = \"x\"\n")
+    assert_eq(added_in("yaml", "requires.pkg_config.yaml", "\"x\""), "@59\n+    yaml = \"x\"\n")

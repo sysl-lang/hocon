@@ -3,12 +3,15 @@
 // A document reads into a value that owns itself -- an object is a `Buf[Field]` and an array a
 // `Buf[Value]` -- and every value and every key carries its `Span`, so a program checking a file it
 // read can point at the line that is wrong. Substitutions (`${a.b}`, `${?a.b}`), concatenation,
-// merging and triple-quoted strings are read; `include` and `+=` are refused by name.
+// merging and triple-quoted strings are read; `include` and `+=` are refused by name. The values are
+// derived from a lossless tree that keeps every byte, and a document is edited by splicing that
+// tree's spans, so comments and layout survive an edit and an edit cannot read a file differently
+// from a build.
 //
 // This is the block a consumer writes to reach it:
 //
 //     dependencies {
-//       hocon { git = "github.com/sysl-lang/hocon", version = "0.2.2" }
+//       hocon { git = "github.com/sysl-lang/hocon", version = "0.3.0" }
 //     }
 //
 // The coordinate names the package, `hocon`; the module a program imports is `sh.sysl.hocon`. Naming
@@ -17,7 +20,7 @@
 
 package {
   name    = "hocon"
-  version = "0.2.2"
+  version = "0.3.0"
   sysl    = "0.6.0"
 }
 

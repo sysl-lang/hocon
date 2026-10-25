@@ -1,0 +1,36 @@
+// A C standard library written in sysl, for machines that have none.
+//
+// It exists for two consumers. keel, the research kernel at `github.com/sysl-lang/keel`, ports C
+// programs through it; and a bare-metal board, where sysl's freestanding targets carry no libc, so a
+// vendored C package that includes `<string.h>` or `<stdlib.h>` has nothing to compile against
+// until something supplies the header and the symbols behind it.
+//
+// This is the block a consumer writes to reach it:
+//
+//     dependencies {
+//       cstd { git = "github.com/sysl-lang/cstd", version = "0.1.7", if = "!libc" }
+//     }
+//
+// `if = "!libc"` takes cstd only where the machine has no C library under the program: on a board
+// its headers become the C system headers of every package below, and its sysl satisfies the
+// symbols; on a hosted machine the entry is dropped and the real libc is the one compiled against
+// and linked. The coordinate names the package, `cstd`; the module is `sh.sysl.cstd`.
+
+package {
+  name    = "cstd"
+  version = "0.1.7"
+  sysl   = "0.6.0"
+}
+
+// `include/` is the C standard library's headers. Where the target has no libc, every dependent's C
+// is compiled with the machine's own header search taken away and these in its place; clang's own
+// freestanding headers (`stddef.h`, `stdint.h`, `stdbool.h`, `limits.h`) stay. Where the target has
+// a libc they are not used at all.
+c {
+  libc { export = ["include"], libc = true }
+}
+
+// **There is deliberately no `requires` block.** Everything here is arithmetic over bytes a caller
+// handed in, or, on a bare-metal target, a weak default a board replaces: the operating-system calls
+// answering ENOSYS, an allocator growing through whatever `sbrk` the link holds, and exits that trap.
+// Nothing asks an operating system for anything itself.

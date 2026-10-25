@@ -1,0 +1,219 @@
+// TinyUSB, vendored at c/tinyusb (upstream 0.21.0, tarball SHA-256 in README.md), with a sysl layer
+// over its device stack.
+//
+// A consumer picks a controller port (`rp2040`, `rp2350`, `stm32h7`), the roles it acts in (`device`,
+// `host`) and the classes it needs; the sizes TinyUSB reads from `tusb_config.h` are options, and the
+// build writes that header's values as `sysl/tinyusb.h`, which `config/tusb_config.h` includes.
+//
+//     dependencies {
+//       tinyusb {
+//         git      = "github.com/sysl-lang/tinyusb"
+//         version  = "0.1.1"
+//         features = [rp2350, cdc]
+//         options  = { vid = 0x2E8A, cdc.rx_buffer = 512 }
+//       }
+//     }
+//
+// `sim` is a port with no hardware under it, for the package's own tests and a host-side application:
+// it is a recording controller that a test drives with bus events.
+
+package {
+  name    = "tinyusb"
+  version = "0.1.1"
+  sysl   = "0.6.0"
+}
+
+dependencies {
+  cstd { git = "github.com/sysl-lang/cstd", version = "0.1.7", if = "!libc" }
+}
+
+// The suite plays a host against the `sim` port with a serial port and a disk. Every other choice is
+// run by the `variant:` tests, which ask the compiler for the suite again with --features and
+// --option; each configuration has its own include root for the generated headers, so they run
+// beside the rest. The `example:` tests build the two applications in examples/ (those need
+// PICO_SDK_PATH and STM32CUBE_H7_PATH, and skip without them).
+test {
+  features = [sim, cdc, msc]
+}
+
+choices {
+  port { doc = "which USB controller TinyUSB drives", of = [rp2040, rp2350, stm32h7, sim] }
+  speed { doc = "the root port's fastest speed", of = [full_speed, high_speed], default = full_speed }
+}
+
+// The core every build compiles. Each class and port file below is guarded by TinyUSB's own CFG_
+// macros, so the lists say what is compiled and the config header says what is in it.
+c {
+  tinyusb {
+    root    = "c/tinyusb/src"
+    include = [".", "/config"]
+    export  = true
+    sources = ["tusb.c", "common/tusb_fifo.c"]
+  }
+}
+
+// /config/tusb_config.h is the package's, and it starts with #include "sysl/tinyusb.h".
+config {
+  CFG_TUSB_OS        = OPT_OS_NONE
+  CFG_TUSB_MEM_ALIGN = "__attribute__((aligned(4)))"
+}
+
+options {
+  debug        { type = u8, default = 0, range = [0, 3], macro = "CFG_TUSB_DEBUG", doc = "TinyUSB's log level; 0 is silent" }
+  vid          { type = u16, default = 0xCAFE, macro = "SYSL_TUSB_VID", doc = "the vendor id the default descriptors carry" }
+  pid          { type = u16, default = 0x4000, macro = "SYSL_TUSB_PID", doc = "the product id the default descriptors carry" }
+  manufacturer { type = string, default = "sysl", doc = "the manufacturer string of the default descriptors" }
+  product      { type = string, default = "TinyUSB device", doc = "the product string of the default descriptors" }
+}
+
+features {
+
+  // ---- ports: one per controller ----
+
+  rp2040 {
+    doc = "the RP2040's USB controller (TinyUSB's rp2040 port)"
+    if  = "thumb && freestanding"
+    requires.headers.pico_sdk = { note = "the pico-sdk", env = "PICO_SDK_PATH" }
+    config { CFG_TUSB_MCU = OPT_MCU_RP2040, SYSL_TUSB_RP2 = 1, PICO_RP2040 = 1 }
+    c {
+      tinyusb {
+        sources = ["portable/raspberrypi/rp2040/{dcd_rp2040,hcd_rp2040,rp2040_usb}.c"]
+        include = ["/config/rp2040", "@pico_sdk/src/rp2040/hardware_regs/include",
+                   "@pico_sdk/src/rp2040/hardware_structs/include", "@pico_sdk/src/rp2040/pico_platform/include",
+                   "@pico_sdk/src/common/pico_base_headers/include", "@pico_sdk/src/common/pico_sync/include",
+                   "@pico_sdk/src/common/pico_time/include", "@pico_sdk/src/rp2_common/hardware_base/include",
+                   "@pico_sdk/src/rp2_common/hardware_irq/include", "@pico_sdk/src/rp2_common/hardware_resets/include",
+                   "@pico_sdk/src/rp2_common/hardware_sync/include", "@pico_sdk/src/rp2_common/hardware_sync_spin_lock/include",
+                   "@pico_sdk/src/rp2_common/hardware_timer/include", "@pico_sdk/src/rp2_common/pico_platform_common/include",
+                   "@pico_sdk/src/rp2_common/pico_platform_compiler/include", "@pico_sdk/src/rp2_common/pico_platform_panic/include",
+                   "@pico_sdk/src/rp2_common/pico_platform_sections/include", "@pico_sdk/src/rp2_common/pico_stdio/include",
+                   "@pico_sdk/src/rp2_common/pico_fix/rp2040_usb_device_enumeration/include"]
+      }
+    }
+  }
+
+  rp2350 {
+    doc = "the RP2350's USB controller (the same port), on its Arm or its RISC-V cores"
+    if  = "freestanding && (thumb || riscv32)"
+    requires.headers.pico_sdk = { note = "the pico-sdk", env = "PICO_SDK_PATH" }
+    config { CFG_TUSB_MCU = OPT_MCU_RP2040, SYSL_TUSB_RP2 = 1, PICO_RP2350 = 1 }
+    c {
+      tinyusb {
+        sources = ["portable/raspberrypi/rp2040/{dcd_rp2040,hcd_rp2040,rp2040_usb}.c"]
+        include = ["/config/rp2350", "@pico_sdk/src/rp2350/hardware_regs/include",
+                   "@pico_sdk/src/rp2350/hardware_structs/include", "@pico_sdk/src/rp2350/pico_platform/include",
+                   "@pico_sdk/src/common/pico_base_headers/include", "@pico_sdk/src/common/pico_sync/include",
+                   "@pico_sdk/src/common/pico_time/include", "@pico_sdk/src/rp2_common/hardware_base/include",
+                   "@pico_sdk/src/rp2_common/hardware_irq/include", "@pico_sdk/src/rp2_common/hardware_resets/include",
+                   "@pico_sdk/src/rp2_common/hardware_sync/include", "@pico_sdk/src/rp2_common/hardware_sync_spin_lock/include",
+                   "@pico_sdk/src/rp2_common/hardware_timer/include", "@pico_sdk/src/rp2_common/pico_platform_common/include",
+                   "@pico_sdk/src/rp2_common/pico_platform_compiler/include", "@pico_sdk/src/rp2_common/pico_platform_panic/include",
+                   "@pico_sdk/src/rp2_common/pico_platform_sections/include", "@pico_sdk/src/rp2_common/pico_stdio/include"]
+      }
+    }
+  }
+
+  stm32h7 {
+    doc = "the STM32H7's Synopsys DWC2 OTG controllers (TinyUSB's dwc2 port)"
+    if  = "thumb && freestanding"
+    requires.headers.stm32cube_h7 = "STMicroelectronics' STM32CubeH7 tree, for its CMSIS headers: github.com/STMicroelectronics/STM32CubeH7"
+    config { CFG_TUSB_MCU = OPT_MCU_STM32H7 }
+    c {
+      tinyusb {
+        sources = ["portable/synopsys/dwc2/{dcd_dwc2,hcd_dwc2,dwc2_common}.c"]
+        include = ["@stm32cube_h7/Drivers/CMSIS/Device/ST/STM32H7xx/Include", "@stm32cube_h7/Drivers/CMSIS/Include"]
+      }
+    }
+  }
+
+  sim {
+    doc = "no hardware: a recording controller a test drives with bus events"
+    if  = "hosted"
+    config {
+      CFG_TUSB_MCU         = OPT_MCU_NONE
+      TUP_DCD_ENDPOINT_MAX = 8
+    }
+    c {
+      tinyusb { sources = ["portable/template/hcd_template.c"] }
+      tinyusb_sim {
+        root    = "c/sim"
+        include = [".", "/c/tinyusb/src", "/config"]
+        sources = ["dcd_sim.c"]
+      }
+    }
+  }
+
+  full_speed { config { CFG_TUD_MAX_SPEED = OPT_MODE_FULL_SPEED, CFG_TUH_MAX_SPEED = OPT_MODE_FULL_SPEED } }
+  high_speed { config { CFG_TUD_MAX_SPEED = OPT_MODE_HIGH_SPEED, CFG_TUH_MAX_SPEED = OPT_MODE_HIGH_SPEED } }
+
+  // ---- roles ----
+
+  device {
+    doc     = "act as a USB device"
+    default = true
+    macro   = "CFG_TUD_ENABLED"
+    options { ep0_size { type = u8, values = [8, 16, 32, 64], default = 64, macro = "CFG_TUD_ENDPOINT0_SIZE" } }
+    c.tinyusb.sources = ["device/usbd.c"]
+  }
+
+  host {
+    doc   = "act as a USB host"
+    macro = "CFG_TUH_ENABLED"
+    options {
+      devices     { type = u8, default = 4, range = [1, 16], macro = "CFG_TUH_DEVICE_MAX", doc = "devices attached at once, hubs included" }
+      enum_buffer { type = u16, default = 256, range = [64, 1024], macro = "CFG_TUH_ENUMERATION_BUFSIZE" }
+    }
+    c.tinyusb.sources = ["host/usbh.c"]
+  }
+
+  // ---- device classes; each enables the device role ----
+
+  cdc {
+    doc     = "a serial port (CDC-ACM)"
+    enables = [device]
+    options {
+      ports     { type = u8,  default = 1,   range = [1, 4],     macro = "CFG_TUD_CDC" }
+      rx_buffer { type = u16, default = 256, range = [64, 4096], macro = "CFG_TUD_CDC_RX_BUFSIZE" }
+      tx_buffer { type = u16, default = 256, range = [64, 4096], macro = "CFG_TUD_CDC_TX_BUFSIZE" }
+    }
+    c.tinyusb.sources = ["class/cdc/cdc_device.c"]
+  }
+
+  msc {
+    doc     = "a disk (mass storage, bulk-only)"
+    enables = [device]
+    options { buffer { type = u16, default = 512, range = [64, 16384], macro = "CFG_TUD_MSC_EP_BUFSIZE" } }
+    config  { CFG_TUD_MSC = 1 }
+    c.tinyusb.sources = ["class/msc/msc_device.c"]
+  }
+
+  hid {
+    doc     = "keyboards, mice, gamepads and raw reports"
+    enables = [device]
+    options {
+      interfaces { type = u8, default = 1,  range = [1, 4],  macro = "CFG_TUD_HID" }
+      buffer     { type = u8, default = 16, range = [8, 64], macro = "CFG_TUD_HID_EP_BUFSIZE" }
+    }
+    c.tinyusb.sources = ["class/hid/hid_device.c"]
+  }
+
+  midi {
+    doc     = "MIDI"
+    enables = [device]
+    options {
+      rx_buffer { type = u16, default = 64, range = [8, 1024], macro = "CFG_TUD_MIDI_RX_BUFSIZE" }
+      tx_buffer { type = u16, default = 64, range = [8, 1024], macro = "CFG_TUD_MIDI_TX_BUFSIZE" }
+    }
+    config  { CFG_TUD_MIDI = 1 }
+    c.tinyusb.sources = ["class/midi/midi_device.c"]
+  }
+
+  // ---- host classes; each enables the host role ----
+
+  host_hub { enables = [host], config { CFG_TUH_HUB = 1 }, c.tinyusb.sources = ["host/hub.c"] }
+  host_cdc { enables = [host], options { ports { type = u8, default = 1, range = [1, 4], macro = "CFG_TUH_CDC" } },
+             c.tinyusb.sources = ["class/cdc/cdc_host.c"] }
+  host_msc { enables = [host], config { CFG_TUH_MSC = 1 }, c.tinyusb.sources = ["class/msc/msc_host.c"] }
+  host_hid { enables = [host], options { interfaces { type = u8, default = 4, range = [1, 8], macro = "CFG_TUH_HID" } },
+             c.tinyusb.sources = ["class/hid/hid_host.c"] }
+}
