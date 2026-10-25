@@ -346,6 +346,10 @@ edit_add_blank_between_blocks()
     // One block's habit does not leak into a block of its own habit.
     assert_eq(added("o {\n  a {\n    x = 1\n  }\n  b {\n    y = 1\n  }\n}\n\nq {\n  r = 1\n}\n", "o.c.z", "1"),
         "o {\n  a {\n    x = 1\n  }\n  b {\n    y = 1\n  }\n  c {\n    z = 1\n  }\n}\n\nq {\n  r = 1\n}\n")
+    // One block alone is no evidence either way: a top-level block is set apart, a nested one is not.
+    assert_eq(added("package {\n  name = \"x\"\n}\n", "dependencies.a", "1"), "package {\n  name = \"x\"\n}\n\ndependencies {\n  a = 1\n}\n")
+    assert_eq(added("package { name = \"x\" }\n", "dependencies.a", "1"), "package { name = \"x\" }\n\ndependencies {\n  a = 1\n}\n")
+    assert_eq(added("r {\n  a {\n    x = 1\n  }\n}\n", "r.c.z", "1"), "r {\n  a {\n    x = 1\n  }\n  c {\n    z = 1\n  }\n}\n")
     // Scalars alone say nothing about blocks.
     assert_eq(added("a = 1\n\nb = 2\n", "c.d", "1"), "a = 1\n\nb = 2\nc {\n  d = 1\n}\n")
     // The file's own line ending.
@@ -561,7 +565,7 @@ matrix_crlf()
 
     assert_eq(replaced(t, "a.b", "2"), "a {\r\n  b = 2\r\n}\r\n")
     assert_eq(added(t, "a.c", "3"), "a {\r\n  b = 1\r\n  c = 3\r\n}\r\n")
-    assert_eq(added(t, "x.y", "3"), "a {\r\n  b = 1\r\n}\r\nx {\r\n  y = 3\r\n}\r\n")
+    assert_eq(added(t, "x.y", "3"), "a {\r\n  b = 1\r\n}\r\n\r\nx {\r\n  y = 3\r\n}\r\n")
     assert_eq(removed(t, "a.b"), "a {\r\n}\r\n")
     assert_eq(removed("# about a\r\na = 1\r\nb = 2\r\n", "a"), "b = 2\r\n")
     assert_eq(removed("x = 1\r\na = 1", "a"), "x = 1")

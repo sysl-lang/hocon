@@ -320,7 +320,14 @@ private addition(tree: Syntax, seen: Buf[Place], block: Node, rest: Buf[string],
     val line = entry_text(rest, value, dotted, sep, block_sep, is_block, column, indent, unit, nl)
 
     // A new entry of several lines gets the blank line the file puts before its own.
-    val gap = if has_newline(line.bytes, 0, line.bytes.len) && blank_between_blocks(b, siblings) then nl else ""
+    // With no gap in the file to learn from, a top-level block after a block is set apart.
+    val after_block = anchor match
+        Some(a) -> a.value.kind match
+            NBlock(_, _) -> !braced(block)
+            _ -> false
+        None -> false
+
+    val gap = if has_newline(line.bytes, 0, line.bytes.len) && blank_between_blocks(b, siblings, after_block) then nl else ""
 
     anchor match
         Some(a) ->
@@ -349,12 +356,10 @@ private addition(tree: Syntax, seen: Buf[Place], block: Node, rest: Buf[string],
 end addition
 
 // Whether the file keeps a blank line between the entries of a block where one of them runs over
-// several lines: more of those gaps blank than not. A tie, or no such gap, is no.
-private blank_between_blocks(b: []const u8, siblings: Buf[Entry]) -> bool
+// several lines: more of those gaps blank than not. A tie is no; no such gap at all is `otherwise`.
+private blank_between_blocks(b: []const u8, siblings: Buf[Entry], otherwise: bool) -> bool
     var blank = 0
     var tight = 0
-
-    if siblings.len() < 2 then return false
 
     for i in 1..<siblings.len()
         val before = siblings.at(i - 1)
@@ -363,7 +368,7 @@ private blank_between_blocks(b: []const u8, siblings: Buf[Entry]) -> bool
         if has_newline(b, before.span.start, before.span.end) || has_newline(b, after.span.start, after.span.end) then
             if blank_line_between(b, before.span.end, after.span.start) then blank += 1 else tight += 1
 
-    blank > tight
+    if blank + tight == 0 then otherwise else blank > tight
 end blank_between_blocks
 
 // Whether a line of nothing but blanks lies between the end of one entry and the start of the next.
