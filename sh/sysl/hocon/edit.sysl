@@ -356,7 +356,7 @@ private addition(tree: Syntax, seen: Buf[Place], block: Node, rest: Buf[string],
 end addition
 
 // Whether the file keeps a blank line between the entries of a block where one of them runs over
-// several lines: more of those gaps blank than not. A tie is no; no such gap at all is `otherwise`.
+// several lines, or both are blocks: more of those gaps blank than not. A tie is no; no such gap at all is `otherwise`.
 private blank_between_blocks(b: []const u8, siblings: Buf[Entry], otherwise: bool) -> bool
     var blank = 0
     var tight = 0
@@ -365,11 +365,17 @@ private blank_between_blocks(b: []const u8, siblings: Buf[Entry], otherwise: boo
         val before = siblings.at(i - 1)
         val after = siblings.at(i)
 
-        if has_newline(b, before.span.start, before.span.end) || has_newline(b, after.span.start, after.span.end) then
+        val long = has_newline(b, before.span.start, before.span.end) || has_newline(b, after.span.start, after.span.end)
+
+        if long || (is_block_entry(before) && is_block_entry(after)) then
             if blank_line_between(b, before.span.end, after.span.start) then blank += 1 else tight += 1
 
     if blank + tight == 0 then otherwise else blank > tight
 end blank_between_blocks
+
+private is_block_entry(e: Entry) -> bool = e.value.kind match
+    NBlock(_, _) -> true
+    _ -> false
 
 // Whether a line of nothing but blanks lies between the end of one entry and the start of the next.
 private blank_line_between(b: []const u8, from: usize, to: usize) -> bool

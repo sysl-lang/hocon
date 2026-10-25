@@ -20,7 +20,7 @@ error: expected ',' or a new line after the value of `pin`
 
 ```hocon
 dependencies {
-  hocon { git = "github.com/sysl-lang/hocon", version = "0.3.2" }
+  hocon { git = "github.com/sysl-lang/hocon", version = "0.3.3" }
 }
 ```
 

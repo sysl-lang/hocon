@@ -350,6 +350,9 @@ edit_add_blank_between_blocks()
     assert_eq(added("package {\n  name = \"x\"\n}\n", "dependencies.a", "1"), "package {\n  name = \"x\"\n}\n\ndependencies {\n  a = 1\n}\n")
     assert_eq(added("package { name = \"x\" }\n", "dependencies.a", "1"), "package { name = \"x\" }\n\ndependencies {\n  a = 1\n}\n")
     assert_eq(added("r {\n  a {\n    x = 1\n  }\n}\n", "r.c.z", "1"), "r {\n  a {\n    x = 1\n  }\n  c {\n    z = 1\n  }\n}\n")
+    // One-line blocks packed together are a habit too, and are followed, as are ones set apart.
+    assert_eq(added("a { x = 1 }\nb { x = 1 }\n", "c.x", "1"), "a { x = 1 }\nb { x = 1 }\nc {\n  x = 1\n}\n")
+    assert_eq(added("a { x = 1 }\n\nb { x = 1 }\n", "c.x", "1"), "a { x = 1 }\n\nb { x = 1 }\n\nc {\n  x = 1\n}\n")
     // Scalars alone say nothing about blocks.
     assert_eq(added("a = 1\n\nb = 2\n", "c.d", "1"), "a = 1\n\nb = 2\nc {\n  d = 1\n}\n")
     // The file's own line ending.
