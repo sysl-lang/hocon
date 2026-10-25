@@ -319,6 +319,9 @@ private addition(tree: Syntax, seen: Buf[Place], block: Node, rest: Buf[string],
 
     val line = entry_text(rest, value, dotted, sep, block_sep, is_block, column, indent, unit, nl)
 
+    // A new entry of several lines gets the blank line the file puts before its own.
+    val gap = if has_newline(line.bytes, 0, line.bytes.len) && blank_between_blocks(b, siblings) then nl else ""
+
     anchor match
         Some(a) ->
             val le = line_end(b, a.span.end)
@@ -327,11 +330,11 @@ private addition(tree: Syntax, seen: Buf[Place], block: Node, rest: Buf[string],
             if braced(block) && block.span.end - 1 >= a.span.end && block.span.end - 1 < le then
                 return (a.span.end, a.span.end, s"$nl$indent$line")
 
-            if le == b.len then return (le, le, s"$nl$indent$line")
+            if le == b.len then return (le, le, s"$nl$gap$indent$line")
 
             val at = past_newline(b, le)
 
-            (at, at, s"$indent$line$nl")
+            (at, at, s"$gap$indent$line$nl")
         None ->
             if braced(block) then
                 val at = line_start(b, block.span.end - 1)
@@ -344,6 +347,39 @@ private addition(tree: Syntax, seen: Buf[Place], block: Node, rest: Buf[string],
             else
                 (b.len, b.len, s"$nl$line")
 end addition
+
+// Whether the file keeps a blank line between the entries of a block where one of them runs over
+// several lines: more of those gaps blank than not. A tie, or no such gap, is no.
+private blank_between_blocks(b: []const u8, siblings: Buf[Entry]) -> bool
+    var blank = 0
+    var tight = 0
+
+    if siblings.len() < 2 then return false
+
+    for i in 1..<siblings.len()
+        val before = siblings.at(i - 1)
+        val after = siblings.at(i)
+
+        if has_newline(b, before.span.start, before.span.end) || has_newline(b, after.span.start, after.span.end) then
+            if blank_line_between(b, before.span.end, after.span.start) then blank += 1 else tight += 1
+
+    blank > tight
+end blank_between_blocks
+
+// Whether a line of nothing but blanks lies between the end of one entry and the start of the next.
+private blank_line_between(b: []const u8, from: usize, to: usize) -> bool
+    val stop = line_start(b, to)
+    var at = past_newline(b, line_end(b, from))
+
+    while at < stop
+        val le = line_end(b, at)
+
+        if all_blank(b, at, le) then return true
+
+        at = past_newline(b, le)
+
+    false
+end blank_line_between
 
 // `, c = 3` into a block that opens and closes on one line -- or, where the line would pass
 // `inline_limit`, that block written out one entry to a line.
@@ -368,19 +404,65 @@ private inline_addition(tree: Syntax, seen: Buf[Place], block: Node, rest: Buf[s
 
     if width <= inline_limit then return (start, end, insert)
 
-    val indent = leading_blanks(b, line_start(b, block.span.start))
+    // The block to write out: this one, or, where its entry shares its line with what comes before it
+    // (`a { b { … } }`), the enclosing inline block, so that the result opens at the line's own indent.
+    var top = block
+    var levels: usize = 0
+    var climbing = true
+
+    while climbing
+        climbing = false
+
+        for p in seen
+            if p.entry.value.span.start == top.span.start && p.entry.value.span.end == top.span.end then
+                val ls = line_start(b, p.entry.span.start)
+
+                if !all_blank(b, ls, p.entry.span.start) && braced(p.block) && !has_newline(b, p.block.span.start, p.block.span.end) then
+                    top = p.block
+                    levels += 1
+                    climbing = true
+                end if
+            end if
+        end for
+    end while
+
+    val indent = leading_blanks(b, line_start(b, top.span.start))
+    var deep = indent
+
+    for _ in 0..<levels
+        deep = s"$deep$unit"
+
+    val added = entry_text(rest, value, false, sep, block_sep, is_block, None, s"$deep$unit", unit, nl)
+
+    (top.span.start, top.span.end, written_out(tree, top, block, added, indent, unit, nl))
+end inline_addition
+
+// An inline block written one entry to a line, with `added` as the last entry of `target`, which is
+// the block itself or one inside it; the entries on the way down to `target` are written out too.
+private written_out(tree: Syntax, blk: Node, target: Node, added: string, indent: string, unit: string, nl: string) -> string
+    val inner = s"$indent$unit"
+    val here = blk.span.start == target.span.start && blk.span.end == target.span.end
     var out = str_builder()
 
     out.push(s"{$nl")
 
-    for s in siblings
-        out.push(s"$indent$unit${tree.text_of(s.span)}$nl")
+    for s in entries_in(blk)
+        val on_the_way = s.value.span.start <= target.span.start && target.span.end <= s.value.span.end && !here
 
-    out.push(s"$indent$unit${entry_text(rest, value, false, sep, block_sep, is_block, None, s"$indent$unit", unit, nl)}$nl")
+        if on_the_way then
+            val head = from_utf8_unchecked(tree.src.bytes[s.span.start..<s.value.span.start])
+            val tail = from_utf8_unchecked(tree.src.bytes[s.value.span.end..<s.span.end])
+
+            out.push(s"$inner$head${written_out(tree, s.value, target, added, inner, unit, nl)}$tail$nl")
+        else
+            out.push(s"$inner${tree.text_of(s.span)}$nl")
+    end for
+
+    if here then out.push(s"$inner$added$nl")
+
     out.push(s"$indent}")
-
-    (block.span.start, block.span.end, out.finish())
-end inline_addition
+    out.finish()
+end written_out
 
 // The text of a new entry on one line, for an inline block: nested blocks written inline too.
 private inline_text(rest: Buf[string], value: string, sep: string, block_sep: string, is_block: bool) -> string
@@ -489,7 +571,8 @@ private writes_dotted(seen: Buf[Place], siblings: Buf[Entry], rest: Buf[string])
 end writes_dotted
 
 // The column the siblings line their `=` (or `{`) up at: the one most of the siblings on lines of
-// their own share, where at least two share it and one of them is padded to reach it. A sibling with
+// their own share, where at least two share it and one of them is padded to reach it -- or where the
+// one sibling there is is padded: a single `name    =` is evidence enough. A sibling with
 // a key too long for the column (`targets.x.linker_script = …` among `doc     =`) does not undo it.
 private aligned_column(b: []const u8, siblings: Buf[Entry]) -> Option[usize]
     var cols: Buf[usize] = buf()
@@ -520,7 +603,7 @@ private aligned_column(b: []const u8, siblings: Buf[Entry]) -> Option[usize]
 
                 if pads.at(j) then padded = true
 
-        if count > most && padded then
+        if (count > most || cols.len() == 1) && padded then
             most = count
             best = Some(cols.at(i))
     end for

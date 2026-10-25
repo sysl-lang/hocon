@@ -314,6 +314,52 @@ edit_add_aligned()
     assert_eq(added("d {\n  a    { v = 1 }\n  long { v = 2 }\n}\n", "d.b", "{ v = 3 }"),
         "d {\n  a    { v = 1 }\n  long { v = 2 }\n  b    { v = 3 }\n}\n")
 
+@test("a single padded sibling is evidence enough of the alignment, and an unpadded one is not")
+edit_add_aligned_single()
+    assert_eq(added("package {\n  name    = \"x\"\n}\n", "package.sysl", "\"0.6.0\""),
+        "package {\n  name    = \"x\"\n  sysl    = \"0.6.0\"\n}\n")
+    assert_eq(added("package {\n  name = \"x\"\n}\n", "package.sysl", "\"0.6.0\""), "package {\n  name = \"x\"\n  sysl = \"0.6.0\"\n}\n")
+    assert_eq(added("name    = \"x\"\n", "sysl", "1"), "name    = \"x\"\nsysl    = 1\n")
+    assert_eq(added("d {\n  a    { v = 1 }\n}\n", "d.b", "{ v = 3 }"), "d {\n  a    { v = 1 }\n  b    { v = 3 }\n}\n")
+    // A key longer than the column takes one space.
+    assert_eq(added("p {\n  a    = 1\n}\n", "p.description", "2"), "p {\n  a    = 1\n  description = 2\n}\n")
+    // Two siblings reaching different columns are not lined up, padded or not.
+    assert_eq(added("p {\n  a   = 1\n  bb = 2\n}\n", "p.c", "3"), "p {\n  a   = 1\n  bb = 2\n  c = 3\n}\n")
+
+@test("a new block follows the file's blank lines between its blocks, at the top level and nested")
+edit_add_blank_between_blocks()
+    val apart = "package {\n  name = \"x\"\n}\n\ndependencies {\n  a = 1\n}\n"
+
+    assert_eq(added(apart, "targets.x", "1"), s"${apart}\ntargets {\n  x = 1\n}\n")
+    // Not at the end of a file that does not end in a new line.
+    assert_eq(added("a {\n  b = 1\n}\n\nc {\n  d = 1\n}", "e.f", "1"), "a {\n  b = 1\n}\n\nc {\n  d = 1\n}\n\ne {\n  f = 1\n}")
+    // A file that packs its blocks together gets none.
+    assert_eq(added("package {\n  name = \"x\"\n}\ndependencies {\n  a = 1\n}\n", "targets.x", "1"),
+        "package {\n  name = \"x\"\n}\ndependencies {\n  a = 1\n}\ntargets {\n  x = 1\n}\n")
+    // A single line is not a block: `c = 1` goes straight after, and so does a one-line block.
+    assert_eq(added(apart, "c", "1"), s"${apart}c = 1\n")
+    // Nested blocks follow the same way, in their own block's habit.
+    assert_eq(added("root {\n  a {\n    x = 1\n  }\n\n  b {\n    y = 1\n  }\n}\n", "root.c.z", "1"),
+        "root {\n  a {\n    x = 1\n  }\n\n  b {\n    y = 1\n  }\n\n  c {\n    z = 1\n  }\n}\n")
+    assert_eq(added("root {\n  a {\n    x = 1\n  }\n  b {\n    y = 1\n  }\n}\n", "root.c.z", "1"),
+        "root {\n  a {\n    x = 1\n  }\n  b {\n    y = 1\n  }\n  c {\n    z = 1\n  }\n}\n")
+    // One block's habit does not leak into a block of its own habit.
+    assert_eq(added("o {\n  a {\n    x = 1\n  }\n  b {\n    y = 1\n  }\n}\n\nq {\n  r = 1\n}\n", "o.c.z", "1"),
+        "o {\n  a {\n    x = 1\n  }\n  b {\n    y = 1\n  }\n  c {\n    z = 1\n  }\n}\n\nq {\n  r = 1\n}\n")
+    // Scalars alone say nothing about blocks.
+    assert_eq(added("a = 1\n\nb = 2\n", "c.d", "1"), "a = 1\n\nb = 2\nc {\n  d = 1\n}\n")
+    // The file's own line ending.
+    assert_eq(added("a {\r\n  x = 1\r\n}\r\n\r\nb {\r\n  y = 1\r\n}\r\n", "c.d", "1"),
+        "a {\r\n  x = 1\r\n}\r\n\r\nb {\r\n  y = 1\r\n}\r\n\r\nc {\r\n  d = 1\r\n}\r\n")
+
+@test("a file that mixes blank and tight gaps between blocks is followed by the majority, and a tie is tight")
+edit_add_blank_mixed()
+    val mostly_apart = "a {\n  x = 1\n}\n\nb {\n  x = 1\n}\nc {\n  x = 1\n}\n\nd {\n  x = 1\n}\n"
+    val tied = "a {\n  x = 1\n}\n\nb {\n  x = 1\n}\nc {\n  x = 1\n}\n"
+
+    assert_eq(added(mostly_apart, "e.x", "1"), s"${mostly_apart}\ne {\n  x = 1\n}\n")
+    assert_eq(added(tied, "e.x", "1"), s"${tied}e {\n  x = 1\n}\n")
+
 @test("add follows the siblings' separator: ':' where they write it, none before a block where they write none")
 edit_add_separator()
     assert_eq(added("a {\n  b: 1\n}\n", "a.c", "2"), "a {\n  b: 1\n  c: 2\n}\n")
@@ -355,6 +401,39 @@ edit_add_reflow()
 
     assert_eq(added(row, "a.c", "1"), s"a { b = \"${repeat_x(81)}\", c = 1 }\n")
     assert_eq(added(row, "a.c", "12"), s"a {\n  b = \"${repeat_x(81)}\"\n  c = 12\n}\n")
+
+private longdep() -> string = "git = \"github.com/sysl-lang/cstd-long-name-for-width\", version = \"0.1.7\", if = \"!libc\""
+
+private longdep_lines(indent: string) -> string =
+    s"${indent}git = \"github.com/sysl-lang/cstd-long-name-for-width\"\n${indent}version = \"0.1.7\"\n${indent}if = \"!libc\"\n"
+
+@test("an inline block inside an inline block is reflowed from the outer one, at the line's own indent")
+edit_add_reflow_nested()
+    val feature = "features = [sim, cdc, msc, hid]\n"
+
+    assert_eq(added(s"dependencies { cstd { ${longdep()} } }\n", "dependencies.cstd.features", "[sim, cdc, msc, hid]"),
+        s"dependencies {\n  cstd {\n${longdep_lines("    ")}    $feature  }\n}\n")
+    // Inside an indented block the result keeps that indent.
+    assert_eq(added(s"x {\n  dependencies { cstd { ${longdep()} } }\n}\n", "x.dependencies.cstd.features", "[sim, cdc, msc, hid]"),
+        s"x {\n  dependencies {\n    cstd {\n${longdep_lines("      ")}      $feature    }\n  }\n}\n")
+    // Three deep, with a sibling on the way down that stays as written.
+    assert_eq(added(s"a { s = 1, b { c { ${longdep()} } } }\n", "a.b.c.d", "1"),
+        s"a {\n  s = 1\n  b {\n    c {\n${longdep_lines("      ")}      d = 1\n    }\n  }\n}\n")
+    // The same block written with '=' or as a dotted key, which already worked, still does.
+    assert_eq(added(s"dependencies {\n  cstd = { ${longdep()} }\n}\n", "dependencies.cstd.features", "[sim, cdc, msc, hid]"),
+        s"dependencies {\n  cstd = {\n${longdep_lines("    ")}    $feature  }\n}\n")
+    assert_eq(added(s"dependencies.cstd { ${longdep()} }\n", "dependencies.cstd.features", "[sim, cdc, msc, hid]"),
+        s"dependencies.cstd {\n${longdep_lines("  ")}  $feature}\n")
+    // set_value reaches the same reflow.
+    assert_eq(set(s"dependencies { cstd { ${longdep()} } }\n", "dependencies.cstd.features", "[sim, cdc, msc, hid]"),
+        s"dependencies {\n  cstd {\n${longdep_lines("    ")}    $feature  }\n}\n")
+
+@test("a nested inline block is reflowed at 101 columns and not at 100")
+edit_add_reflow_nested_limit()
+    val row = s"o { i { k = \"${repeat_x(75)}\" } }\n"
+
+    assert_eq(added(row, "o.i.c", "1"), s"o { i { k = \"${repeat_x(75)}\", c = 1 } }\n")
+    assert_eq(added(row, "o.i.c", "12"), s"o {\n  i {\n    k = \"${repeat_x(75)}\"\n    c = 12\n  }\n}\n")
 
 private repeat_x(n: int) -> string
     var b = str_builder()
@@ -586,7 +665,7 @@ golden_cstd()
     assert_eq(removed_in("cstd", "package.sysl"), "@22\n-  sysl   = \"0.6.0\"\n")
     assert_eq(replaced_in("cstd", "c.libc.libc", "false"),
         "@30\n-  libc { export = [\"include\"], libc = true }\n+  libc { export = [\"include\"], libc = false }\n")
-    assert_eq(added_in("cstd", "test.features", "[sim]"), "@32\n+test {\n+  features = [sim]\n+}\n")
+    assert_eq(added_in("cstd", "test.features", "[sim]"), "@33\n+test {\n+  features = [sim]\n+}\n+\n")
     assert_eq(added_in("cstd", "c", "1"), "refused: 29:1 `c` is already set, on line 29: replace it rather than add it")
 
 @test("golden: skiff's tiny workspace manifest")
