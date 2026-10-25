@@ -127,7 +127,7 @@ struct Value
     as_word(self) -> Option[string]
         self.kind match
             Word(s) -> Some(s)
-            Int(n, w) -> Some(if w.is_empty() then str(n) else w)
+            Int(n, w) -> Some(if w.is_empty() then n.to_string() else w)
             Real(x, w) -> Some(if w.is_empty() then real_text(x) else w)
             Null -> Some("null")
             _ -> None
@@ -430,7 +430,7 @@ private render_value(b: *StrBuilder, v: Value, depth: int)
                 b.push("]")
         Str(s) -> b.push(quoted(s))
         Word(s) -> b.push(if bare_word(s) then s else quoted(s))
-        Int(n, w) -> b.push(if w.is_empty() then str(n) else w)
+        Int(n, w) -> b.push(if w.is_empty() then n.to_string() else w)
         Real(x, w) -> b.push(if w.is_empty() then real_text(x) else w)
         Bool(on) -> b.push(if on then "true" else "false")
         Null -> b.push("null")
@@ -464,7 +464,7 @@ private indent(b: *StrBuilder, depth: int)
 
 // A real written so that it reads back as a real: `1.0` and not `1`, which would come back an `Int`.
 private real_text(x: real) -> string
-    val t = str(x)
+    val t = x.to_string()
 
     for c in t.bytes
         if c == u8('.') || c == u8('e') || c == u8('E') || c == u8('n') || c == u8('i') then return t
