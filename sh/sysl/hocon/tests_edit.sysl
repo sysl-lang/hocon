@@ -52,12 +52,12 @@ private change(before: string, after: string) -> string
     val z = lines_of(after)
     var p: usize = 0
 
-    while p < a.len() && p < z.len() && a.at(p) == z.at(p)
+    while p < a.len() && p < z.len() && a[p] == z[p]
         p += 1
 
     var s: usize = 0
 
-    while s < a.len() - p && s < z.len() - p && a.at(a.len() - 1 - s) == z.at(z.len() - 1 - s)
+    while s < a.len() - p && s < z.len() - p && a[a.len() - 1 - s] == z[z.len() - 1 - s]
         s += 1
 
     var b = str_builder()
@@ -65,10 +65,10 @@ private change(before: string, after: string) -> string
     b.push(s"@${p + 1}\n")
 
     for i in p..<a.len() - s
-        b.push(s"-${a.at(i)}\n")
+        b.push(s"-${a[i]}\n")
 
     for i in p..<z.len() - s
-        b.push(s"+${z.at(i)}\n")
+        b.push(s"+${z[i]}\n")
 
     b.finish()
 end change
@@ -171,15 +171,15 @@ syntax_entries()
         NBlock(entries, braced) ->
             assert(!braced)
             assert_eq(entries.len(), 2usize)
-            assert_eq(path_text(entries.at(0).names()), "a.\"b.c\"")
-            assert_eq(tree.text_of(entries.at(0).span), "a.\"b.c\" = 1")
-            assert_eq(tree.text_of(entries.at(0).path.at(1).span), "\"b.c\"")
-            assert_eq(tree.text_of(entries.at(1).span), "d { e = x y }")
+            assert_eq(path_text(entries[0].names()), "a.\"b.c\"")
+            assert_eq(tree.text_of(entries[0].span), "a.\"b.c\" = 1")
+            assert_eq(tree.text_of(entries[0].path[1].span), "\"b.c\"")
+            assert_eq(tree.text_of(entries[1].span), "d { e = x y }")
 
-            entries.at(1).value.kind match
+            entries[1].value.kind match
                 NBlock(inner, on) ->
                     assert(on)
-                    assert_eq(tree.text_of(inner.at(0).value.span), "x y")
+                    assert_eq(tree.text_of(inner[0].value.span), "x y")
                 _ -> panic("d is a block")
         _ -> panic("the root is a block")
 
@@ -200,7 +200,7 @@ syntax_no_block_comment()
 syntax_path_of()
     assert_eq(path_text(path_of("a.b").unwrap()), "a.b")
     assert_eq(path_of("a.\"b.c\"").unwrap().len(), 2usize)
-    assert_eq(path_of("a.\"b.c\"").unwrap().at(1), "b.c")
+    assert_eq(path_of("a.\"b.c\"").unwrap()[1], "b.c")
 
     path_of("a..b") match
         Ok(_) -> panic("read")

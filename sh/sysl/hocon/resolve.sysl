@@ -158,7 +158,7 @@ private concat(r: *Resolver, span: Span, parts: Buf[Value], path: Buf[string]) -
     var first: Option[Value] = None
 
     for i in 0..<got.len()
-        if !gaps.at(i) && first.is_none() then first = Some(got.at(i))
+        if !gaps[i] && first.is_none() then first = Some(got[i])
 
     val lead = first match
         Some(x) -> x
@@ -169,9 +169,9 @@ private concat(r: *Resolver, span: Span, parts: Buf[Value], path: Buf[string]) -
         var seen = false
 
         for i in 0..<got.len()
-            if gaps.at(i) then continue
+            if gaps[i] then continue
 
-            val x = got.at(i)
+            val x = got[i]
 
             if !seen then
                 seen = true
@@ -200,7 +200,7 @@ private concat(r: *Resolver, span: Span, parts: Buf[Value], path: Buf[string]) -
     var b = str_builder()
 
     for i in 0..<got.len()
-        val x = got.at(i)
+        val x = got[i]
 
         if x.is_obj() || x.is_arr() then
             return Err(error(x.span, s"cannot concatenate ${lead.kind_name()} with ${x.kind_name()}"))
@@ -245,12 +245,12 @@ merged(below: Value, top: Value) -> Value
         var found = false
 
         for i in 0..<out.len()
-            val old = out.at(i)
+            val old = out[i]
 
             if old.key == f.key then
                 val v = if old.value.is_obj() && f.value.is_obj() then merged(old.value, f.value) else f.value
 
-                out.set(i, Field(old.key, old.key_span, v, old.implied && f.implied))
+                out[i] = Field(old.key, old.key_span, v, old.implied && f.implied)
                 found = true
                 break
             end if

@@ -50,12 +50,12 @@ replace_value(src: Source, path: string, value: string) -> Result[Edit, Diagnost
     val names = joined_names(p.prefix, e.names())
 
     if names.len() > target.len() then
-        return Err(error(e.path.at(0).span,
+        return Err(error(e.path[0].span,
             s"`${path_text(target)}` is written only as part of the key `${path_text(names)}` on line ${line_of(src, e.span.start)}, so it has no value of its own to replace"))
 
     // A block written without `=` (`a { … }`) gains one when what replaces it is not a block.
     val b = src.bytes
-    val key_end = e.path.at(e.path.len() - 1).span.end
+    val key_end = e.path[e.path.len() - 1].span.end
     val sepless = first_after_blanks(b, key_end) == e.value.span.start
 
     if sepless && !value.bytes.is_empty() && value.bytes[0] != u8('{') then
@@ -91,8 +91,8 @@ add_entry(src: Source, path: string, value: string) -> Result[Edit, Diagnostic]
     val here = places(seen, target)
 
     if !here.is_empty() then
-        return Err(error(here.at(0).entry.path.at(0).span,
-            s"`${path_text(target)}` is already set, on line ${line_of(src, here.at(0).entry.span.start)}: replace it rather than add it"))
+        return Err(error(here[0].entry.path[0].span,
+            s"`${path_text(target)}` is already set, on line ${line_of(src, here[0].entry.span.start)}: replace it rather than add it"))
 
     val (block, rest) = home_of(src, tree, seen, target)?
     val (start, end, insert) = addition(tree, seen, block, rest, value)
@@ -161,13 +161,13 @@ private the_place(src: Source, seen: Buf[Place], target: Buf[string], verb: stri
     if here.is_empty() then
         return Err(error(point(0), s"there is no `${path_text(target)}` to $verb"))
 
-    if here.len() > 1 then return Err(two_places(src, target, here.at(0), here.at(1)))
+    if here.len() > 1 then return Err(two_places(src, target, here[0], here[1]))
 
-    Ok(here.at(0))
+    Ok(here[0])
 end the_place
 
 private two_places(src: Source, target: Buf[string], a: Place, b: Place) -> Diagnostic =
-    error(b.entry.path.at(0).span,
+    error(b.entry.path[0].span,
         s"`${path_text(target)}` is written in two places, lines ${line_of(src, a.entry.span.start)} and ${line_of(src, b.entry.span.start)}, and an edit would have to guess which one is meant")
         .with_label("written again here")
         .with_note("write it in one place by hand, then make the edit")
@@ -189,9 +189,9 @@ private home_of(src: Source, tree: Syntax, seen: Buf[Place], target: Buf[string]
                         return Err(error(p.entry.value.span,
                             s"`${path_text(prefix)}` is set on line ${line_of(src, p.entry.span.start)} to a value that is not an object, so `${path_text(target)}` cannot be added under it"))
 
-        if blocks > 0 && here.len() > 1 then return Err(two_places(src, prefix, here.at(0), here.at(1)))
+        if blocks > 0 && here.len() > 1 then return Err(two_places(src, prefix, here[0], here[1]))
 
-        if blocks == 1 then return Ok((here.at(0).entry.value, rest_names(target, k)))
+        if blocks == 1 then return Ok((here[0].entry.value, rest_names(target, k)))
 
         k -= 1
     end while
@@ -230,14 +230,14 @@ private removal(tree: Syntax, p: Place) -> (usize, usize, string)
     val siblings = entries_in(p.block)
     var i: usize = 0
 
-    while i < siblings.len() && siblings.at(i).span.start != e.span.start
+    while i < siblings.len() && siblings[i].span.start != e.span.start
         i += 1
 
-    if i + 1 < siblings.len() && !has_newline(b, e.span.end, siblings.at(i + 1).span.start) then
-        return (e.span.start, siblings.at(i + 1).span.start, "")
+    if i + 1 < siblings.len() && !has_newline(b, e.span.end, siblings[i + 1].span.start) then
+        return (e.span.start, siblings[i + 1].span.start, "")
 
-    if i > 0 && !has_newline(b, siblings.at(i - 1).span.end, e.span.start) then
-        return (siblings.at(i - 1).span.end, e.span.end, "")
+    if i > 0 && !has_newline(b, siblings[i - 1].span.end, e.span.start) then
+        return (siblings[i - 1].span.end, e.span.end, "")
 
     // The only entry of a block that opens and closes on its line: `{ a = 1 }` becomes `{}`.
     if braced(p.block) && !has_newline(b, p.block.span.start, p.block.span.end) then
@@ -362,8 +362,8 @@ private blank_between_blocks(b: []const u8, siblings: Buf[Entry], otherwise: boo
     var tight = 0
 
     for i in 1..<siblings.len()
-        val before = siblings.at(i - 1)
-        val after = siblings.at(i)
+        val before = siblings[i - 1]
+        val after = siblings[i]
 
         val long = has_newline(b, before.span.start, before.span.end) || has_newline(b, after.span.start, after.span.end)
 
@@ -405,7 +405,7 @@ private inline_addition(tree: Syntax, seen: Buf[Place], block: Node, rest: Buf[s
         if siblings.is_empty() then
             (block.span.start + 1, close, s" $one_line ")
         else
-            val last = siblings.at(siblings.len() - 1).span.end
+            val last = siblings[siblings.len() - 1].span.end
 
             (last, last, s", $one_line")
 
@@ -481,9 +481,9 @@ private inline_text(rest: Buf[string], value: string, sep: string, block_sep: st
     val last = rest.len() - 1
 
     for i in 0..<last
-        b.push(s"${key_of(one_name(rest.at(i)))} { ")
+        b.push(s"${key_of(one_name(rest[i]))} { ")
 
-    b.push(key_of(one_name(rest.at(last))))
+    b.push(key_of(one_name(rest[last])))
     b.push(binder(sep, block_sep, is_block))
     b.push(value)
 
@@ -497,7 +497,7 @@ end inline_text
 // line's new line: `key = value`, `a.b = value`, or the nested blocks a missing path needs.
 private entry_text(rest: Buf[string], value: string, dotted: bool, sep: string, block_sep: string, is_block: bool,
                    column: Option[usize], indent: string, unit: string, nl: string) -> string
-    val first = if dotted then key_of(rest) else key_of(one_name(rest.at(0)))
+    val first = if dotted then key_of(rest) else key_of(one_name(rest[0]))
     val pad = column match
         Some(c) ->
             val used = chars(indent.bytes, 0, indent.bytes.len) + chars(first.bytes, 0, first.bytes.len)
@@ -521,11 +521,11 @@ private entry_text(rest: Buf[string], value: string, dotted: bool, sep: string, 
 
     for i in 1..<last
         depth = s"$depth$unit"
-        b.push(s"$depth${key_of(one_name(rest.at(i)))} {$nl")
+        b.push(s"$depth${key_of(one_name(rest[i]))} {$nl")
 
     val inner = s"$depth$unit"
 
-    b.push(s"$inner${key_of(one_name(rest.at(last)))}${binder(sep, block_sep, is_block)}$value$nl")
+    b.push(s"$inner${key_of(one_name(rest[last]))}${binder(sep, block_sep, is_block)}$value$nl")
 
     var i = rest.len() - 2
 
@@ -554,7 +554,7 @@ private key_of(names: Buf[string]) -> string
     for i in 0..<names.len()
         if i > 0 then b.push(".")
 
-        val k = names.at(i)
+        val k = names[i]
         var bare = !k.is_empty()
 
         for j in 0..<k.bytes.len
@@ -593,7 +593,7 @@ private aligned_column(b: []const u8, siblings: Buf[Entry]) -> Option[usize]
         val ls = line_start(b, s.span.start)
 
         if all_blank(b, ls, s.span.start) then
-            val key_end = s.path.at(s.path.len() - 1).span.end
+            val key_end = s.path[s.path.len() - 1].span.end
             val at = first_after_blanks(b, key_end)
 
             cols.push(chars(b, ls, at))
@@ -609,14 +609,14 @@ private aligned_column(b: []const u8, siblings: Buf[Entry]) -> Option[usize]
         var padded = false
 
         for j in 0..<cols.len()
-            if cols.at(j) == cols.at(i) then
+            if cols[j] == cols[i] then
                 count += 1
 
-                if pads.at(j) then padded = true
+                if pads[j] then padded = true
 
         if (count > most || cols.len() == 1) && padded then
             most = count
-            best = Some(cols.at(i))
+            best = Some(cols[i])
     end for
 
     best
@@ -640,7 +640,7 @@ private indent_unit(b: []const u8, seen: Buf[Place]) -> string
 end indent_unit
 
 private byte_after_key(b: []const u8, e: Entry) -> u8
-    val at = first_after_blanks(b, e.path.at(e.path.len() - 1).span.end)
+    val at = first_after_blanks(b, e.path[e.path.len() - 1].span.end)
 
     if at < b.len then b[at] else 0
 
@@ -675,7 +675,7 @@ private one_value(value: string) -> Result[unit, Diagnostic]
         Ok(tree) ->
             val n = entries_in(tree.root)
 
-            if n.len() == 1 && n.at(0).path.len() == 1 && n.at(0).value.span.end == src.bytes.len then return Ok(())
+            if n.len() == 1 && n[0].path.len() == 1 && n[0].value.span.end == src.bytes.len then return Ok(())
 
             Err(error(point(0), s"`$value` is not one value"))
         Err(d) -> Err(error(point(0), s"`$value` is not one value").with_note(d.message))
@@ -772,7 +772,7 @@ private spaces(n: usize) -> string
 private common(a: Buf[string], b: Buf[string]) -> usize
     var n: usize = 0
 
-    while n < a.len() && n < b.len() && a.at(n) == b.at(n)
+    while n < a.len() && n < b.len() && a[n] == b[n]
         n += 1
 
     n
@@ -795,7 +795,7 @@ private first_names(path: Buf[string], n: usize) -> Buf[string]
     var out: Buf[string] = buf()
 
     for i in 0..<n
-        out.push(path.at(i))
+        out.push(path[i])
 
     out
 
@@ -803,7 +803,7 @@ private rest_names(path: Buf[string], n: usize) -> Buf[string]
     var out: Buf[string] = buf()
 
     for i in n..<path.len()
-        out.push(path.at(i))
+        out.push(path[i])
 
     out
 

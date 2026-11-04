@@ -111,11 +111,11 @@ private file_path(repeats: *Buf[Repeat], fields: *Buf[Field], prefix: Buf[string
     while i > 0
         var inner: Buf[Field] = buf()
 
-        inner.push(Field(path.at(i).name, path.at(i).span, v, i < path.len() - 1))
-        v = Value(path.at(i).span.to(v.span), Obj(inner))
+        inner.push(Field(path[i].name, path[i].span, v, i < path.len() - 1))
+        v = Value(path[i].span.to(v.span), Obj(inner))
         i -= 1
 
-    put(repeats, fields, prefix, Field(path.at(0).name, path.at(0).span, v, path.len() > 1))
+    put(repeats, fields, prefix, Field(path[0].name, path[0].span, v, path.len() > 1))
 end file_path
 
 // One field into an object's fields. **A name already there is HOCON's merge**: two objects become
@@ -123,7 +123,7 @@ end file_path
 // a substitution, a concatenation -- is kept as a merge of layers for the resolver to decide.
 private put(repeats: *Buf[Repeat], fields: *Buf[Field], prefix: Buf[string], f: Field)
     for i in 0..<fields.len()
-        val old = fields.at(i)
+        val old = fields[i]
 
         if old.key == f.key then
             val here = joined1(prefix, f.key)
@@ -147,7 +147,7 @@ private put(repeats: *Buf[Repeat], fields: *Buf[Field], prefix: Buf[string], f: 
                         _ -> layered(old.value, f.value)
                 _ -> layered(old.value, f.value)
 
-            fields.set(i, Field(old.key, old.key_span, merged, old.implied && f.implied))
+            fields[i] = Field(old.key, old.key_span, merged, old.implied && f.implied)
             return
         end if
     end for

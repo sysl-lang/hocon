@@ -336,7 +336,7 @@ private read_field(r: *Reader, open: Option[usize]) -> Result[Entry, Diagnostic]
             return Err(error(r.s.here(), s"'${key_words(names)}' names nothing")
                 .with_label("expected '=', ':' or '{' after the key"))
 
-    Ok(Entry(path, path.at(0).span.to(value.span), value))
+    Ok(Entry(path, path[0].span.to(value.span), value))
 end read_field
 
 private names_of(path: Buf[Key]) -> Buf[string]
@@ -528,9 +528,9 @@ private read_value(r: *Reader) -> Result[Node, Diagnostic]
 
         return Err(error(span, "a value was expected").with_label(s"found ${found(r, one(r.s.offset))}"))
 
-    if parts.len() == 1 then return Ok(parts.at(0))
+    if parts.len() == 1 then return Ok(parts[0])
 
-    Ok(Node(parts.at(0).span.to(parts.at(parts.len() - 1).span), NJoined(parts)))
+    Ok(Node(parts[0].span.to(parts[parts.len() - 1].span), NJoined(parts)))
 end read_value
 
 // `${a.b}` and `${?a.b}`.
@@ -669,7 +669,7 @@ private key_words(path: Buf[string]) -> string
     for i in 0..<path.len()
         if i > 0 then b.push(".")
 
-        b.push(path.at(i))
+        b.push(path[i])
 
     b.finish()
 end key_words

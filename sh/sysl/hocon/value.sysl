@@ -281,7 +281,7 @@ object_of(fields: Buf[(string, Value)]) -> Value
     for f in fields
         out.push(Field(f.0, f.1.span, f.1, false))
 
-    val span = if fields.is_empty() then Span(0, 0) else fields.at(0).1.span.to(fields.at(fields.len() - 1).1.span)
+    val span = if fields.is_empty() then Span(0, 0) else fields[0].1.span.to(fields[fields.len() - 1].1.span)
 
     Value(span, Obj(out))
 end object_of
@@ -295,7 +295,7 @@ same(a: Value, b: Value) -> bool
                     if xs.len() != ys.len() then return false
 
                     for i in 0..<xs.len()
-                        if xs.at(i).key != ys.at(i).key || !same(xs.at(i).value, ys.at(i).value)
+                        if xs[i].key != ys[i].key || !same(xs[i].value, ys[i].value)
                             return false
 
                     true
@@ -335,7 +335,7 @@ private same_items(xs: Buf[Value], ys: Buf[Value]) -> bool
     if xs.len() != ys.len() then return false
 
     for i in 0..<xs.len()
-        if !same(xs.at(i), ys.at(i)) then return false
+        if !same(xs[i], ys[i]) then return false
 
     true
 end same_items
@@ -344,7 +344,7 @@ private same_names(xs: Buf[string], ys: Buf[string]) -> bool
     if xs.len() != ys.len() then return false
 
     for i in 0..<xs.len()
-        if xs.at(i) != ys.at(i) then return false
+        if xs[i] != ys[i] then return false
 
     true
 end same_names
@@ -358,7 +358,7 @@ path_text(segments: Buf[string]) -> string
     for i in 0..<segments.len()
         if i > 0 then b.push(".")
 
-        b.push(key_text(segments.at(i)))
+        b.push(key_text(segments[i]))
 
     b.finish()
 end path_text
@@ -415,7 +415,7 @@ private render_value(b: *StrBuilder, v: Value, depth: int)
                 for i in 0..<items.len()
                     if i > 0 then b.push(", ")
 
-                    render_value(b, items.at(i), depth)
+                    render_value(b, items[i], depth)
 
                 b.push("]")
             else
@@ -448,7 +448,7 @@ private render_value(b: *StrBuilder, v: Value, depth: int)
             for i in 0..<layers.len()
                 if i > 0 then b.push(" ")
 
-                render_value(b, layers.at(i), depth)
+                render_value(b, layers[i], depth)
 end render_value
 
 private all_scalars(items: Buf[Value]) -> bool

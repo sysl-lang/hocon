@@ -50,7 +50,7 @@ private text_at_list(v: Value, key: string) -> string
                 for i in 0..<xs.len()
                     if i > 0 then b.push(" ")
 
-                    b.push(xs.at(i))
+                    b.push(xs[i])
 
                 b.finish()
 
@@ -124,9 +124,9 @@ keys_come_back_in_order()
     val fields = read("b = 1\na = 2\nc = 3").fields()
 
     assert_eq(fields.len(), 3)
-    assert_eq(fields.at(0).key, "b")
-    assert_eq(fields.at(1).key, "a")
-    assert_eq(fields.at(2).key, "c")
+    assert_eq(fields[0].key, "b")
+    assert_eq(fields[1].key, "a")
+    assert_eq(fields[2].key, "c")
 
 @test("a list is read in order, and the keys after it still are")
 a_list_is_read()
@@ -134,9 +134,9 @@ a_list_is_read()
     val items = v.get("deps").unwrap().items()
 
     assert_eq(items.len(), 3)
-    assert_eq(items.at(0).as_text(), Some("a"))
-    assert_eq(items.at(1).as_text(), Some("b"))
-    assert_eq(items.at(2).as_text(), Some("c"))
+    assert_eq(items[0].as_text(), Some("a"))
+    assert_eq(items[1].as_text(), Some("b"))
+    assert_eq(items[2].as_text(), Some("c"))
     assert_eq(text_at(v, "name"), "geom")
 
 @test("a missing name answers nothing, and so does asking a string for a key")
@@ -186,7 +186,7 @@ dotted_keys_nest_and_merge()
     assert_eq(v.at("a.b.d").unwrap().as_long(), Some(2))
     assert_eq(v.at("a.e").unwrap().as_long(), Some(3))
     assert_eq(v.fields().len(), 1)
-    assert(v.fields().at(0).implied, "a dotted key's object is implied")
+    assert(v.fields()[0].implied, "a dotted key's object is implied")
 
 @test("two objects under one name merge deeply, and a later plain value replaces")
 duplicate_keys_merge()
@@ -208,17 +208,17 @@ repeats_are_recorded()
     val doc = parse(src).unwrap()
 
     assert_eq(doc.repeats.len(), 2)
-    assert_eq(doc.repeats.at(0).path, "parts.led")
-    assert_eq(s"${src.locate(doc.repeats.at(0).first.start)}", "2:3")
-    assert_eq(s"${src.locate(doc.repeats.at(0).again.start)}", "3:3")
-    assert_eq(doc.repeats.at(1).path, "parts.led.pin")
+    assert_eq(doc.repeats[0].path, "parts.led")
+    assert_eq(s"${src.locate(doc.repeats[0].first.start)}", "2:3")
+    assert_eq(s"${src.locate(doc.repeats[0].again.start)}", "3:3")
+    assert_eq(doc.repeats[1].path, "parts.led.pin")
     assert_eq(doc.root.at("parts.led.pin").unwrap().as_long(), Some(2))
 
 @test("a repeat's path quotes a name holding a dot")
 a_repeat_path_is_quoted()
     val doc = read_doc("\"a.b\" = 1\n\"a.b\" = 2")
 
-    assert_eq(doc.repeats.at(0).path, "\"a.b\"")
+    assert_eq(doc.repeats[0].path, "\"a.b\"")
 
 // -- arrays ----------------------------------------------------------------------------------------
 
@@ -228,9 +228,9 @@ arrays_of_objects()
     val items = v.get("wires").unwrap().items()
 
     assert_eq(items.len(), 3)
-    assert_eq(text_at(items.at(0), "to"), "b")
-    assert_eq(text_at(items.at(1), "from"), "c")
-    assert_eq(items.at(2).items().at(1).as_long(), Some(2))
+    assert_eq(text_at(items[0], "to"), "b")
+    assert_eq(text_at(items[1], "from"), "c")
+    assert_eq(items[2].items()[1].as_long(), Some(2))
 
 @test("an empty array and an empty object")
 empty_containers()
@@ -277,7 +277,7 @@ substitutions_resolve()
     assert_eq(v.at("led.color").unwrap().as_text(), Some("red"))
     assert_eq(v.get("n").unwrap().as_long(), Some(16))
     assert_eq(v.get("c").unwrap().as_long(), Some(16))
-    assert_eq(v.get("list").unwrap().items().at(0).as_long(), Some(16))
+    assert_eq(v.get("list").unwrap().items()[0].as_long(), Some(16))
 
 @test("a substitution may name a later key, and a path through another substitution")
 substitutions_reach_forward_and_through()
@@ -563,11 +563,11 @@ keys_in_order()
     val keys = v.keys()
 
     assert_eq(keys.len(), 3)
-    assert_eq(s"${keys.at(0)} ${keys.at(1)} ${keys.at(2)}", "b a c")
+    assert_eq(s"${keys[0]} ${keys[1]} ${keys[2]}", "b a c")
 
     val inner = v.get("a").unwrap().keys()
 
-    assert_eq(s"${inner.len()} ${inner.at(0)} ${inner.at(1)} ${inner.at(2)}", "3 x y z")
+    assert_eq(s"${inner.len()} ${inner[0]} ${inner[1]} ${inner[2]}", "3 x y z")
     assert_eq(v.get("b").unwrap().keys().len(), 0)
     assert_eq(read("[1, 2]").keys().len(), 0)
 
@@ -577,9 +577,9 @@ flags_in_order()
     val flags = v.get("requires").unwrap().flags()
 
     assert_eq(flags.len(), 3)
-    assert_eq(s"${flags.at(0).0}=${flags.at(0).1}", "heap=true")
-    assert_eq(s"${flags.at(1).0}=${flags.at(1).1}", "os=false")
-    assert_eq(s"${flags.at(2).0}=${flags.at(2).1}", "fs=true")
+    assert_eq(s"${flags[0].0}=${flags[0].1}", "heap=true")
+    assert_eq(s"${flags[1].0}=${flags[1].1}", "os=false")
+    assert_eq(s"${flags[2].0}=${flags[2].1}", "fs=true")
     assert_eq(read("a = true").get("a").unwrap().flags().len(), 0)
 
 @test("object_of builds an object in the order given, which reads and renders as a written one")
@@ -592,7 +592,7 @@ objects_built_by_a_program()
 
     val built = object_of(fields)
 
-    assert_eq(s"${built.keys().at(0)} ${built.keys().at(1)}", "second first")
+    assert_eq(s"${built.keys()[0]} ${built.keys()[1]}", "second first")
     assert_eq(built.scalar_at("first"), Some("1"))
     assert_eq(render(built), "second = \"x\"\nfirst = 1\n")
     assert(same(built, read("second = \"x\", first = 1")), "the same tree as the text")
